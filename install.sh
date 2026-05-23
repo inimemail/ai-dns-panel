@@ -31,16 +31,32 @@ AI_CHECK_URLS=(
   "https://copilot.microsoft.com"
   "https://perplexity.ai"
   "https://grok.com"
+  "https://midjourney.com"
   "https://deepseek.com"
   "https://mistral.ai"
+  "https://openrouter.ai"
+  "https://character.ai"
+  "https://poe.com"
+  "https://meta.ai"
+  "https://you.com"
+)
+AI_API_CHECKS=(
+  "OpenAI|api.openai.com|https://api.openai.com/v1/models|Authorization: Bearer invalid_token_test|Content-Type: application/json"
+  "Anthropic|api.anthropic.com|https://api.anthropic.com/v1/models|x-api-key: invalid_token_test|anthropic-version: 2023-06-01"
+  "Gemini|generativelanguage.googleapis.com|https://generativelanguage.googleapis.com/v1beta/models?key=invalid_token_test|Content-Type: application/json|"
+  "Perplexity|api.perplexity.ai|https://api.perplexity.ai/models|Authorization: Bearer invalid_token_test|Content-Type: application/json"
+  "xAI|api.x.ai|https://api.x.ai/v1/models|Authorization: Bearer invalid_token_test|Content-Type: application/json"
+  "DeepSeek|api.deepseek.com|https://api.deepseek.com/v1/models|Authorization: Bearer invalid_token_test|Content-Type: application/json"
+  "Mistral|api.mistral.ai|https://api.mistral.ai/v1/models|Authorization: Bearer invalid_token_test|Content-Type: application/json"
+  "OpenRouter|openrouter.ai|https://openrouter.ai/api/v1/models|Authorization: Bearer invalid_token_test|Content-Type: application/json"
 )
 
 PUBLIC_DNS_SERVERS=("1.1.1.1" "8.8.8.8")
 
-OPENAI_DOMAINS=("openai.com" "chatgpt.com" "oaiusercontent.com" "oaistatic.com")
-ANTHROPIC_DOMAINS=("anthropic.com" "claude.ai" "claude.com" "claudeusercontent.com")
-GOOGLE_DOMAINS=("google.com" "googleapis.com" "gstatic.com" "googleusercontent.com" "ggpht.com" "ytimg.com" "withgoogle.com" "googletagmanager.com" "googlevideo.com" "gemini.google.com" "aistudio.google.com")
-PERPLEXITY_DOMAINS=("perplexity.ai" "perplexity.com")
+OPENAI_DOMAINS=("openai.com" "api.openai.com" "auth.openai.com" "platform.openai.com" "chatgpt.com" "oaiusercontent.com" "oaistatic.com")
+ANTHROPIC_DOMAINS=("anthropic.com" "api.anthropic.com" "claude.ai" "claude.com" "claudeusercontent.com")
+GOOGLE_DOMAINS=("google.com" "googleapis.com" "generativelanguage.googleapis.com" "gstatic.com" "googleusercontent.com" "ggpht.com" "ytimg.com" "withgoogle.com" "googletagmanager.com" "googlevideo.com" "gemini.google.com" "aistudio.google.com")
+PERPLEXITY_DOMAINS=("perplexity.ai" "perplexity.com" "api.perplexity.ai")
 XAI_DOMAINS=("x.ai" "grok.com" "api.x.ai")
 MICROSOFT_DOMAINS=("copilot.microsoft.com" "bing.com")
 MIDJOURNEY_DOMAINS=("midjourney.com" "alpha.midjourney.com")
@@ -446,6 +462,87 @@ check_unlock_sni_endpoint() {
   print_ai_http_result "SNI" "$url" "$code"
 }
 
+check_ai_api_endpoint() {
+  local server_ip="$1" name="$2" host="$3" url="$4" header1="$5" header2="$6"
+  local code body detail safe_name
+  safe_name="$(printf '%s' "$name" | tr -cd 'A-Za-z0-9_-' | tr 'A-Z' 'a-z')"
+  body="/tmp/ai_unlock_${safe_name}_api_check.log"
+  if [ -n "$header2" ]; then
+    code="$(curl -k -sS --connect-timeout 5 --max-time 12 \
+      --resolve "${host}:443:${server_ip}" \
+      -H "$header1" -H "$header2" \
+      -o "$body" -w '%{http_code}' "$url" 2>/dev/null || true)"
+  else
+    code="$(curl -k -sS --connect-timeout 5 --max-time 12 \
+      --resolve "${host}:443:${server_ip}" \
+      -H "$header1" \
+      -o "$body" -w '%{http_code}' "$url" 2>/dev/null || true)"
+  fi
+  detail="$(tr '\n' ' ' < "$body" 2>/dev/null | sed 's/[[:space:]][[:space:]]*/ /g' | cut -c1-180)"
+  case "$code" in
+    400|401)
+      printf "  %b %s -> %s 无效请求/凭据（API 可达）\n" "$(color 32 "[$name通过]")" "$host" "$code"
+      return 0
+      ;;
+    403)
+      printf "  %b %s -> 403 受限/Forbidden\n" "$(color 31 "[$name受限]")" "$host"
+      [ -n "$detail" ] && printf "      %s\n" "$detail"
+      return 1
+      ;;
+    2*)
+      printf "  %b %s -> %s（链路可达）\n" "$(color 33 "[$name可达]")" "$host" "$code"
+      return 0
+      ;;
+    429)
+      printf "  %b %s -> 429 限流（链路可达）\n" "$(color 33 "[$name限流]")" "$host"
+      return 0
+      ;;
+    ""|000)
+      printf "  %b %s -> 连接失败\n" "$(color 31 "[$name失败]")" "$host"
+      return 1
+      ;;
+    *)
+      printf "  %b %s -> HTTP %s\n" "$(color 31 "[$name异常]")" "$host" "$code"
+      [ -n "$detail" ] && printf "      %s\n" "$detail"
+      return 1
+      ;;
+  esac
+}
+
+check_all_ai_api_unlock() {
+  local server_ip="$1" item name host url header1 header2 ok_count=0 total=0
+  for item in "${AI_API_CHECKS[@]}"; do
+    IFS='|' read -r name host url header1 header2 <<EOF
+$item
+EOF
+    total=$((total + 1))
+    if check_ai_api_endpoint "$server_ip" "$name" "$host" "$url" "$header1" "$header2"; then
+      ok_count=$((ok_count + 1))
+    fi
+  done
+  printf "  API 判定通过项: %s/%s\n" "$ok_count" "$total"
+}
+
+collect_ai_check_hosts() {
+  local item name host url header1 header2 seen_hosts="" web_host
+  for item in "${AI_API_CHECKS[@]}"; do
+    IFS='|' read -r name host url header1 header2 <<EOF
+$item
+EOF
+    [ -z "$host" ] && continue
+    case " $seen_hosts " in *" $host "*) continue ;; esac
+    seen_hosts="$seen_hosts $host"
+    printf '%s\n' "$host"
+  done
+  for url in "${AI_CHECK_URLS[@]}"; do
+    web_host="$(printf '%s\n' "$url" | awk -F/ '{print $3}')"
+    [ -z "$web_host" ] && continue
+    case " $seen_hosts " in *" $web_host "*) continue ;; esac
+    seen_hosts="$seen_hosts $web_host"
+    printf '%s\n' "$web_host"
+  done
+}
+
 show_unlock_summary() {
   clear
   local server_ip
@@ -476,19 +573,23 @@ show_unlock_summary() {
   printf "DNS 分流检测（查询本机 dnsmasq）：\n"
   local domain dns_ok_count=0 dns_total=0
   check_unlock_dns_forward "$server_ip" "example.com" || true
-  for domain in "chatgpt.com" "claude.ai" "gemini.google.com" "perplexity.ai"; do
+  while IFS= read -r domain; do
+    [ -z "$domain" ] && continue
     dns_total=$((dns_total + 1))
     if check_unlock_dns_split "$server_ip" "$domain"; then dns_ok_count=$((dns_ok_count + 1)); fi
-  done
+  done < <(collect_ai_check_hosts)
   printf "  AI 域名命中: %s/%s\n" "$dns_ok_count" "$dns_total"
   echo "--------------------------------------"
-  printf "SNI 解锁链路检测（强制域名连接到解锁机 443）：\n"
+  printf "AI API 解锁判定（无效凭据返回 400/401 表示 API 可达，403 为受限）：\n"
+  check_all_ai_api_unlock "$server_ip" || true
+  echo "--------------------------------------"
+  printf "网页 SNI 连通参考（首页可能被 WAF/跳转影响，不作为唯一判定）：\n"
   local url sni_ok_count=0 sni_total=0
   for url in "${AI_CHECK_URLS[@]}"; do
     sni_total=$((sni_total + 1))
     if check_unlock_sni_endpoint "$server_ip" "$url"; then sni_ok_count=$((sni_ok_count + 1)); fi
   done
-  printf "  SNI 通过项: %s/%s\n" "$sni_ok_count" "$sni_total"
+  printf "  网页参考通过项: %s/%s\n" "$sni_ok_count" "$sni_total"
   echo "--------------------------------------"
   info "这个检测看的是解锁链路；节点机仍需加入白名单，并在云安全组放行 UDP/TCP 53 与 TCP 443。"
 }
@@ -656,6 +757,7 @@ serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 tower-cookies = "0.10"
+time = "=0.3.36"
 urlencoding = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 AI_UNLOCK_PANEL_CARGO_EOF
@@ -687,6 +789,14 @@ use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
 
+struct ApiCheck {
+    name: &'static str,
+    host: &'static str,
+    url: &'static str,
+    header1: &'static str,
+    header2: &'static str,
+}
+
 const BASE_DIR: &str = "/etc/ai_unlock";
 const CUSTOM_DOMAIN_FILE: &str = "/etc/ai_unlock/custom_domains.conf";
 const NODE_WHITELIST_FILE: &str = "/etc/ai_unlock/node_whitelist.conf";
@@ -703,27 +813,48 @@ const SNI_SYSTEMD_SERVICE: &str = "/etc/systemd/system/sniproxy.service";
 const FIREWALL_CHAIN: &str = "AI_UNLOCK_DNS";
 const DEFAULT_PORT: u16 = 8088;
 const PUBLIC_DNS: &[&str] = &["1.1.1.1", "8.8.8.8"];
-const AI_URLS: &[&str] = &[
+const API_CHECKS: &[ApiCheck] = &[
+    ApiCheck { name: "OpenAI", host: "api.openai.com", url: "https://api.openai.com/v1/models", header1: "Authorization: Bearer invalid_token_test", header2: "Content-Type: application/json" },
+    ApiCheck { name: "Anthropic", host: "api.anthropic.com", url: "https://api.anthropic.com/v1/models", header1: "x-api-key: invalid_token_test", header2: "anthropic-version: 2023-06-01" },
+    ApiCheck { name: "Gemini", host: "generativelanguage.googleapis.com", url: "https://generativelanguage.googleapis.com/v1beta/models?key=invalid_token_test", header1: "Content-Type: application/json", header2: "" },
+    ApiCheck { name: "Perplexity", host: "api.perplexity.ai", url: "https://api.perplexity.ai/models", header1: "Authorization: Bearer invalid_token_test", header2: "Content-Type: application/json" },
+    ApiCheck { name: "xAI", host: "api.x.ai", url: "https://api.x.ai/v1/models", header1: "Authorization: Bearer invalid_token_test", header2: "Content-Type: application/json" },
+    ApiCheck { name: "DeepSeek", host: "api.deepseek.com", url: "https://api.deepseek.com/v1/models", header1: "Authorization: Bearer invalid_token_test", header2: "Content-Type: application/json" },
+    ApiCheck { name: "Mistral", host: "api.mistral.ai", url: "https://api.mistral.ai/v1/models", header1: "Authorization: Bearer invalid_token_test", header2: "Content-Type: application/json" },
+    ApiCheck { name: "OpenRouter", host: "openrouter.ai", url: "https://openrouter.ai/api/v1/models", header1: "Authorization: Bearer invalid_token_test", header2: "Content-Type: application/json" },
+];
+const WEB_CHECK_URLS: &[&str] = &[
     "https://chatgpt.com",
     "https://claude.ai",
     "https://gemini.google.com",
     "https://copilot.microsoft.com",
     "https://perplexity.ai",
     "https://grok.com",
+    "https://midjourney.com",
     "https://deepseek.com",
     "https://mistral.ai",
+    "https://openrouter.ai",
+    "https://character.ai",
+    "https://poe.com",
+    "https://meta.ai",
+    "https://you.com",
 ];
 const BASE_DOMAINS: &[&str] = &[
     "openai.com",
+    "api.openai.com",
+    "auth.openai.com",
+    "platform.openai.com",
     "chatgpt.com",
     "oaiusercontent.com",
     "oaistatic.com",
     "anthropic.com",
+    "api.anthropic.com",
     "claude.ai",
     "claude.com",
     "claudeusercontent.com",
     "google.com",
     "googleapis.com",
+    "generativelanguage.googleapis.com",
     "gstatic.com",
     "googleusercontent.com",
     "ggpht.com",
@@ -735,6 +866,7 @@ const BASE_DOMAINS: &[&str] = &[
     "aistudio.google.com",
     "perplexity.ai",
     "perplexity.com",
+    "api.perplexity.ai",
     "x.ai",
     "grok.com",
     "api.x.ai",
@@ -1154,15 +1286,30 @@ fn dashboard_html(state: &AppState, session: &Session, host: &str, q: &HashMap<S
         host,
         urlencoding::encode(&state.join_token)
     );
-    let checks = AI_URLS
+    let api_checks = API_CHECKS
         .iter()
-        .map(|u| {
-            let ok = check_sni(u, &ip);
+        .map(|check| {
+            let ok = check_ai_api(check, &ip);
             format!(
-                r#"<div class="check"><span class="{}">{}</span><strong>{}</strong></div>"#,
+                r#"<div class="check"><span class="{}">{}</span><strong>{}: {}</strong></div>"#,
                 if ok { "ok" } else { "bad" },
                 if ok { "通过" } else { "失败" },
-                html(u)
+                html(check.name),
+                html(check.host)
+            )
+        })
+        .collect::<String>();
+    let web_checks = WEB_CHECK_URLS
+        .iter()
+        .map(|url| {
+            let host = host_from_url(url);
+            let ok = check_sni_url(url, &ip);
+            format!(
+                r#"<div class="check"><span class="{}">{}</span><strong>{}: {}</strong></div>"#,
+                if ok { "ok" } else { "bad" },
+                if ok { "通过" } else { "失败" },
+                html(host),
+                html(url)
             )
         })
         .collect::<String>();
@@ -1183,7 +1330,8 @@ fn dashboard_html(state: &AppState, session: &Session, host: &str, q: &HashMap<S
   </div>
 </section>
 <section class="glass"><div class="head"><div><h2>节点机快速使用命令</h2><p>在节点机 root 终端执行。</p></div></div><pre class="cmd">{quick}</pre></section>
-<section class="glass"><div class="head"><div><h2>SNI 解锁链路测试</h2><p>强制域名连接到本机 443，只把 2xx 计为通过。</p></div></div><div class="checks">{checks}</div></section>"#,
+<section class="glass"><div class="head"><div><h2>AI API 解锁判定</h2><p>强制 API 连接到本机 443，无效凭据返回 400/401 计为可达，403 为受限。</p></div></div><div class="checks">{api_checks}</div></section>
+<section class="glass"><div class="head"><div><h2>AI 网页 SNI 连通参考</h2><p>覆盖没有模型 API 检测入口的网页服务，首页跳转或 WAF 仅作参考。</p></div></div><div class="checks">{web_checks}</div></section>"#,
         flash = flash(q),
         ip = html(&ip),
         dns = service_status("dnsmasq"),
@@ -1193,7 +1341,8 @@ fn dashboard_html(state: &AppState, session: &Session, host: &str, q: &HashMap<S
         count = nodes.len(),
         csrf = html(&session.csrf),
         quick = html(&quick),
-        checks = checks
+        api_checks = api_checks,
+        web_checks = web_checks
     )
 }
 
@@ -1602,13 +1751,48 @@ fn detect_public_ip() -> String {
     output("sh", &["-c", "hostname -I 2>/dev/null | awk '{print $1}'"])
 }
 
-fn check_sni(url: &str, server_ip: &str) -> bool {
-    let host = url.split('/').nth(2).unwrap_or("");
+fn check_ai_api(check: &ApiCheck, server_ip: &str) -> bool {
+    if server_ip.is_empty() {
+        return false;
+    }
+    let resolve = format!("{}:443:{server_ip}", check.host);
+    let mut command = Command::new("curl");
+    command.args([
+        "-k",
+        "-sS",
+        "--connect-timeout",
+        "5",
+        "--max-time",
+        "12",
+        "--resolve",
+        resolve.as_str(),
+        "-H",
+        check.header1,
+    ]);
+    if !check.header2.is_empty() {
+        command.args(["-H", check.header2]);
+    }
+    command.args(["-o", "/dev/null", "-w", "%{http_code}", check.url]);
+    let code = command
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    code == "400" || code == "401" || code == "429" || code.starts_with('2')
+}
+
+fn host_from_url(url: &str) -> &str {
+    url.split('/').nth(2).unwrap_or("")
+}
+
+fn check_sni_url(url: &str, server_ip: &str) -> bool {
+    let host = host_from_url(url);
     if host.is_empty() || server_ip.is_empty() {
         return false;
     }
     let resolve = format!("{host}:443:{server_ip}");
-    output(
+    let code = output(
         "curl",
         &[
             "-k",
@@ -1626,8 +1810,8 @@ fn check_sni(url: &str, server_ip: &str) -> bool {
             "%{http_code}",
             url,
         ],
-    )
-    .starts_with('2')
+    );
+    code.starts_with('2')
 }
 
 fn service_status(name: &str) -> String {
@@ -1777,26 +1961,53 @@ prepare_panel_source() {
   write_embedded_panel_source
 }
 
+cargo_supports_2024() {
+  command_exists cargo || return 1
+  local version major minor rest
+  version="$(cargo -V 2>/dev/null | awk '{print $2}')"
+  major="${version%%.*}"
+  rest="${version#*.}"
+  minor="${rest%%.*}"
+  [ -n "$major" ] && [ -n "$minor" ] || return 1
+  if [ "$major" -gt 1 ] 2>/dev/null; then return 0; fi
+  if [ "$major" -eq 1 ] 2>/dev/null && [ "$minor" -ge 85 ] 2>/dev/null; then return 0; fi
+  return 1
+}
+
+install_rustup_stable() {
+  command_exists curl || install_packages curl ca-certificates || return 1
+  info "系统 Cargo 过旧，安装 rustup stable 工具链..."
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable || return 1
+  if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi
+  cargo_supports_2024
+}
+
 install_rust_build_deps() {
-  if command_exists cargo && command_exists rustc; then return 0; fi
+  if command_exists cargo && command_exists rustc && cargo_supports_2024; then return 0; fi
   info "安装 Rust 本地编译环境..."
   if command_exists apt-get; then
     apt-get update -y
-    DEBIAN_FRONTEND=noninteractive apt-get install -y cargo rustc build-essential pkg-config ca-certificates
+    DEBIAN_FRONTEND=noninteractive apt-get install -y cargo rustc build-essential pkg-config ca-certificates curl
   elif command_exists dnf; then
-    dnf install -y cargo rust rustc gcc gcc-c++ make pkgconf-pkg-config ca-certificates
+    dnf install -y cargo rust rustc gcc gcc-c++ make pkgconf-pkg-config ca-certificates curl
   elif command_exists yum; then
-    yum install -y cargo rust rustc gcc gcc-c++ make pkgconfig ca-certificates
+    yum install -y cargo rust rustc gcc gcc-c++ make pkgconfig ca-certificates curl
   elif command_exists pacman; then
-    pacman -Sy --noconfirm cargo rust base-devel pkgconf ca-certificates
+    pacman -Sy --noconfirm cargo rust base-devel pkgconf ca-certificates curl
   elif command_exists zypper; then
-    zypper --non-interactive install -y cargo rust gcc gcc-c++ make pkg-config ca-certificates
+    zypper --non-interactive install -y cargo rust gcc gcc-c++ make pkg-config ca-certificates curl
   elif command_exists apk; then
-    apk add --no-cache cargo rust build-base pkgconf ca-certificates
+    apk add --no-cache cargo rust build-base pkgconf ca-certificates curl
   else
     err "未找到可用包管理器，无法安装 Rust。"
     return 1
   fi
+  if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi
+  if command_exists cargo && command_exists rustc && cargo_supports_2024; then return 0; fi
+  install_rustup_stable || {
+    err "Cargo 版本过旧，且 rustup stable 安装失败。请手动安装 Rust 1.85+ 后重试。"
+    return 1
+  }
 }
 
 set_panel_password() {
@@ -1885,16 +2096,20 @@ EOF
   warn "请在云安全组放行面板端口，建议只允许自己的 IP 访问。"
 }
 
+cleanup_panel_rust_artifacts() {
+  rm -f "$PANEL_BIN"
+  rm -rf "$PANEL_WORK_DIR"
+  rm -rf "$BASE_DIR/panel_src"
+}
+
 uninstall_panel_service() {
   if command_exists systemctl; then
     systemctl disable ai-unlock-panel.service 2>/dev/null || true
     systemctl stop ai-unlock-panel.service 2>/dev/null || true
-    rm -f "$PANEL_SERVICE"
     systemctl daemon-reload 2>/dev/null || true
   fi
-  rm -f "$PANEL_BIN"
-  rm -rf "$PANEL_WORK_DIR"
-  rm -rf "$BASE_DIR/panel_src"
+  rm -f "$PANEL_SERVICE"
+  cleanup_panel_rust_artifacts
   ok "Web 面板程序已卸载。"
 }
 
@@ -2020,20 +2235,18 @@ uninstall_unlock_core() {
     if command_exists systemctl; then
       systemctl disable ai-unlock-panel.service 2>/dev/null || true
       systemctl stop ai-unlock-panel.service 2>/dev/null || true
-      rm -f "$PANEL_SERVICE"
       systemctl disable ai-unlock-firewall.service 2>/dev/null || true
       systemctl stop ai-unlock-firewall.service 2>/dev/null || true
-      rm -f "$SYSTEMD_SERVICE"
       systemctl disable sniproxy.service 2>/dev/null || true
       systemctl stop sniproxy.service 2>/dev/null || true
-      rm -f "$SNI_SYSTEMD_SERVICE"
       systemctl daemon-reload 2>/dev/null || true
     fi
+    rm -f "$PANEL_SERVICE" "$SYSTEMD_SERVICE" "$SNI_SYSTEMD_SERVICE"
     remove_firewall_rules
+    cleanup_panel_rust_artifacts
     
     rm -rf "$BASE_DIR"
-    rm -f "$DNSMASQ_CONF" "$SNI_CONF" "$PANEL_BIN"
-    rm -rf "$PANEL_WORK_DIR"
+    rm -f "$DNSMASQ_CONF" "$SNI_CONF" "$SNI_CONF_DIR"
     
     service_stop dnsmasq
     service_stop sniproxy
@@ -2185,8 +2398,9 @@ test_node_dns() {
   echo "--------------------------------------"
   info "分流解析状态:"
 
-  local dns_ok_count=0 dns_miss_count=0 dns_timeout_count=0
-  for domain in "chatgpt.com" "claude.ai" "gemini.google.com" "perplexity.ai"; do
+  local dns_ok_count=0 dns_miss_count=0 dns_timeout_count=0 domain
+  while IFS= read -r domain; do
+    [ -z "$domain" ] && continue
     local resolved=""
     if command_exists dig; then resolved="$(dig @"$configured_dns" "$domain" A +time=3 +tries=1 +short 2>/dev/null | awk '/^[0-9]+\./ {print; exit}')"; fi
     if [ -z "$resolved" ] && command_exists nslookup; then resolved="$(nslookup -type=A "$domain" "$configured_dns" 2>/dev/null | awk '/^Address: / {print $2}' | grep -E '^[0-9]+\.' | tail -n 1)"; fi
@@ -2196,7 +2410,7 @@ test_node_dns() {
       if [ "$resolved" = "$configured_dns" ]; then dns_ok_count=$((dns_ok_count + 1)); printf "  %b %s -> %s\n" "$(color 32 "[成功]")" "$domain" "$resolved"
       else dns_miss_count=$((dns_miss_count + 1)); printf "  %b %s -> %s（未命中解锁机）\n" "$(color 31 "[失败]")" "$domain" "$resolved"; fi
     else dns_timeout_count=$((dns_timeout_count + 1)); printf "  %b %s -> 无 A 记录响应\n" "$(color 33 "[无响应]")" "$domain"; fi
-  done
+  done < <(collect_ai_check_hosts)
   if [ "$dns_ok_count" -eq 0 ] && [ "$dns_timeout_count" -gt 0 ]; then
     warn "AI 域名 A 记录无响应：请在解锁机白名单添加【节点机公网 IP】，并在云服务商安全组放行 UDP/TCP 53。"
     [ -n "$node_public_ip" ] && warn "当前节点公网 IP 是 $node_public_ip，请确认它已经在解锁机白名单中。"
