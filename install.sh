@@ -468,9 +468,25 @@ http_code_is_reachable() {
   esac
 }
 
-curl_ai_via_sniproxy() {
-  local host="$1"; shift
-  curl -k -sS -L --connect-timeout 6 --max-time 18 --resolve "${host}:443:127.0.0.1" -H "User-Agent: Mozilla/5.0" "$@"
+resolve_public_a_record() {
+  local host="$1" dns resolved=""
+  for dns in "${PUBLIC_DNS_SERVERS[@]}"; do
+    resolved="$(resolve_a_record "$dns" "$host")"
+    [ -n "$resolved" ] && printf '%s\n' "$resolved" && return 0
+  done
+  if command_exists getent; then
+    resolved="$(getent ahostsv4 "$host" 2>/dev/null | awk '/STREAM/ {print $1; exit}')"
+    [ -n "$resolved" ] && printf '%s\n' "$resolved" && return 0
+  fi
+  return 1
+}
+
+curl_ai_direct_egress() {
+  local host="$1" ip
+  shift
+  ip="$(resolve_public_a_record "$host")" || return 7
+  [ -z "$ip" ] && return 7
+  curl -k -sS -L --connect-timeout 6 --max-time 18 --resolve "${host}:443:${ip}" -H "User-Agent: Mozilla/5.0" "$@"
 }
 
 print_ai_unlock_status() {
@@ -482,15 +498,15 @@ print_ai_unlock_status() {
   esac
 }
 
-check_chatgpt_unlock() {
-  local res code url trace loc colo api_res
-  res="$(curl_ai_via_sniproxy "chat.openai.com" -o /dev/null -w '%{http_code}:%{url_effective}' "https://chat.openai.com/" 2>/dev/null || true)"
+check_chatgpt_web_unlock() {
+  local res code url trace loc colo
+  res="$(curl_ai_direct_egress "chat.openai.com" -o /dev/null -w '%{http_code}:%{url_effective}' "https://chat.openai.com/" 2>/dev/null || true)"
   code="${res%%:*}"
   url="${res#*:}"
   if echo "$url" | grep -Eqi 'sorry|blocked|unsupported_country' || [ "$code" = "403" ]; then
     print_ai_unlock_status "ChatGPT Web" no "地区不支持"
   elif [ "$code" = "200" ] || [ "$code" = "307" ]; then
-    trace="$(curl_ai_via_sniproxy "chat.openai.com" "https://chat.openai.com/cdn-cgi/trace" 2>/dev/null || true)"
+    trace="$(curl_ai_direct_egress "chat.openai.com" "https://chat.openai.com/cdn-cgi/trace" 2>/dev/null || true)"
     loc="$(printf '%s\n' "$trace" | awk -F= '/^loc=/ {print $2; exit}')"
     colo="$(printf '%s\n' "$trace" | awk -F= '/^colo=/ {print $2; exit}')"
     print_ai_unlock_status "ChatGPT Web" ok "可访问${loc:+（出口: $loc${colo:+/$colo}）}"
@@ -499,8 +515,11 @@ check_chatgpt_unlock() {
   else
     print_ai_unlock_status "ChatGPT Web" err "检测失败 HTTP $code"
   fi
+}
 
-  api_res="$(curl_ai_via_sniproxy "api.openai.com" "https://api.openai.com/v1/models" 2>/dev/null || true)"
+check_openai_api_unlock() {
+  local api_res
+  api_res="$(curl_ai_direct_egress "api.openai.com" "https://api.openai.com/v1/models" 2>/dev/null || true)"
   if echo "$api_res" | grep -Eqi 'unsupported_country|country_not_supported'; then
     print_ai_unlock_status "OpenAI API" no "地区不支持"
   elif echo "$api_res" | grep -Eqi '"data"[[:space:]]*:[[:space:]]*\['; then
@@ -514,7 +533,7 @@ check_chatgpt_unlock() {
 
 check_ai_page_unlock() {
   local name="$1" host="$2" url="$3" ok_codes="$4" block_regex="$5" res code final_url
-  res="$(curl_ai_via_sniproxy "$host" -o /dev/null -w '%{http_code}:%{url_effective}' "$url" 2>/dev/null || true)"
+  res="$(curl_ai_direct_egress "$host" -o /dev/null -w '%{http_code}:%{url_effective}' "$url" 2>/dev/null || true)"
   code="${res%%:*}"
   final_url="${res#*:}"
   if [ -z "$code" ] || [ "$code" = "000" ]; then
@@ -537,7 +556,7 @@ check_ai_page_unlock() {
 
 check_ai_api_unlock() {
   local name="$1" host="$2" api_url="$3" ok_codes="$4" no_code="$5" ok_text="$6" no_text="$7" code
-  code="$(curl_ai_via_sniproxy "$host" -o /dev/null -w '%{http_code}' "$api_url" 2>/dev/null || true)"
+  code="$(curl_ai_direct_egress "$host" -o /dev/null -w '%{http_code}' "$api_url" 2>/dev/null || true)"
   if [ -z "$code" ] || [ "$code" = "000" ]; then
     print_ai_unlock_status "$name" err "网络连接失败"
     return 1
@@ -558,7 +577,7 @@ check_ai_api_unlock() {
 
 check_copilot_unlock() {
   local res code final_url api_code
-  res="$(curl_ai_via_sniproxy "copilot.microsoft.com" -o /dev/null -w '%{http_code}:%{url_effective}' "https://copilot.microsoft.com/" 2>/dev/null || true)"
+  res="$(curl_ai_direct_egress "copilot.microsoft.com" -o /dev/null -w '%{http_code}:%{url_effective}' "https://copilot.microsoft.com/" 2>/dev/null || true)"
   code="${res%%:*}"
   final_url="${res#*:}"
   if [ -z "$code" ] || [ "$code" = "000" ]; then
@@ -571,7 +590,7 @@ check_copilot_unlock() {
   fi
   case "$code" in
     200|301|302)
-      api_code="$(curl_ai_via_sniproxy "copilot.microsoft.com" -o /dev/null -w '%{http_code}' "https://copilot.microsoft.com/c/api/user" 2>/dev/null || true)"
+      api_code="$(curl_ai_direct_egress "copilot.microsoft.com" -o /dev/null -w '%{http_code}' "https://copilot.microsoft.com/c/api/user" 2>/dev/null || true)"
       if [ "$api_code" = "200" ] || [ "$api_code" = "401" ]; then
         print_ai_unlock_status "Microsoft Copilot" ok "可访问"
         return 0
@@ -644,7 +663,8 @@ check_kimi_unlock() {
 
 check_all_ai_http_egress() {
   local ok_count=0 total=0
-  total=$((total + 1)); check_chatgpt_unlock && ok_count=$((ok_count + 1))
+  total=$((total + 1)); check_chatgpt_web_unlock && ok_count=$((ok_count + 1))
+  total=$((total + 1)); check_openai_api_unlock && ok_count=$((ok_count + 1))
   total=$((total + 1)); check_ai_page_unlock "Google Gemini" "gemini.google.com" "https://gemini.google.com/" "200 301 302" "sorry|geo|blocked" && ok_count=$((ok_count + 1))
   total=$((total + 1)); check_ai_page_unlock "Claude" "claude.ai" "https://claude.ai/" "200 307" "blocked|geo|unavailable" && ok_count=$((ok_count + 1))
   total=$((total + 1)); check_copilot_unlock && ok_count=$((ok_count + 1))
@@ -714,7 +734,7 @@ show_unlock_summary() {
   done < <(collect_ai_check_hosts)
   printf "  AI 域名命中: %s/%s\n" "$dns_ok_count" "$dns_total"
   echo "--------------------------------------"
-  printf "AI HTTPS 出口检测（经本机 sniproxy）：\n"
+  printf "AI HTTPS 出口检测（绕过本机分流）：\n"
   check_all_ai_http_egress || true
   echo "--------------------------------------"
 }
@@ -969,6 +989,8 @@ const BASE_DOMAINS: &[&str] = &[
     "auth.openai.com",
     "platform.openai.com",
     "chatgpt.com",
+    "chat.openai.com",
+    "sora.com",
     "oaiusercontent.com",
     "oaistatic.com",
     "anthropic.com",
@@ -1007,11 +1029,14 @@ const BASE_DOMAINS: &[&str] = &[
     "console.mistral.ai",
     "api.mistral.ai",
     "character.ai",
+    "neo.character.ai",
     "poe.com",
     "openrouter.ai",
     "platform.openrouter.ai",
     "meta.ai",
     "you.com",
+    "kimi.moonshot.cn",
+    "api.moonshot.cn",
 ];
 
 #[derive(Clone)]
@@ -2080,6 +2105,7 @@ fn sync_firewall(nodes: &[Node]) -> io::Result<()> {
 
 fn update_rules() -> io::Result<()> {
     fs::create_dir_all("/etc/dnsmasq.d")?;
+    write_public_resolv_conf();
     let server_ip = detect_public_ip();
     let domains = collect_domains()?;
     let mut dns = String::from("# generated by ai-unlock-panel\nport=53\nlisten-address=0.0.0.0\nbind-interfaces\nno-resolv\n");
@@ -2112,6 +2138,16 @@ fn update_rules() -> io::Result<()> {
     run_ignore("systemctl", &["restart", "dnsmasq"]);
     run_ignore("systemctl", &["restart", "sniproxy"]);
     Ok(())
+}
+
+fn write_public_resolv_conf() {
+    run_ignore("chattr", &["-i", "/etc/resolv.conf"]);
+    let mut resolv = String::new();
+    for upstream in PUBLIC_DNS {
+        resolv.push_str(&format!("nameserver {upstream}\n"));
+    }
+    let _ = fs::remove_file("/etc/resolv.conf");
+    let _ = fs::write("/etc/resolv.conf", resolv);
 }
 
 fn enable_sniproxy() -> io::Result<()> {
@@ -2522,6 +2558,7 @@ escape_regex_domain() { printf '%s' "$1" | sed 's/\./\\./g'; }
 
 update_rules() {
   ensure_base_dir; mkdir -p /etc/dnsmasq.d
+  write_public_resolv_conf
   SERVER_IP="$(detect_public_ip)"
   info "生成分流配置..."
   {
