@@ -1268,15 +1268,30 @@ if [ -z "$NODE_IP" ]; then
   exit 1
 fi
 curl -fsS --max-time 8 "$PANEL_URL/node-join?token=$TOKEN&ip=$NODE_IP&name=$NODE_NAME" >/dev/null
-if command -v systemctl >/dev/null 2>&1 && systemctl is-active systemd-resolved >/dev/null 2>&1; then
+if command -v systemctl >/dev/null 2>&1; then
   systemctl stop systemd-resolved 2>/dev/null || true
   systemctl disable systemd-resolved 2>/dev/null || true
+  systemctl mask systemd-resolved 2>/dev/null || true
 fi
 chattr -i /etc/resolv.conf 2>/dev/null || true
+chattr -i /run/systemd/resolve/stub-resolv.conf 2>/dev/null || true
+chattr -i /run/systemd/resolve/resolv.conf 2>/dev/null || true
 rm -f /etc/resolv.conf
 printf 'nameserver %s\n' "$UNLOCK_IP" > /etc/resolv.conf
 chattr +i /etc/resolv.conf 2>/dev/null || true
 echo "节点机 DNS 已指向 $UNLOCK_IP"
+if [ -L /etc/resolv.conf ]; then
+  echo "警告: /etc/resolv.conf 仍然是 symlink -> $(readlink /etc/resolv.conf 2>/dev/null || true)"
+else
+  echo "正常: /etc/resolv.conf 已切换为普通文件"
+fi
+if command -v systemctl >/dev/null 2>&1 && systemctl is-active systemd-resolved >/dev/null 2>&1; then
+  echo "警告: systemd-resolved 仍然 active，可能绕过 /etc/resolv.conf"
+else
+  echo "正常: systemd-resolved 未运行"
+fi
+echo "当前 /etc/resolv.conf:"
+cat /etc/resolv.conf 2>/dev/null || true
 "#
     );
     ([(axum::http::header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")], body).into_response()
@@ -1297,6 +1312,9 @@ TOKEN="{token}"
 NODE_IP="$(curl -k -fs4 --max-time 5 https://1.1.1.1/cdn-cgi/trace 2>/dev/null | awk -F= '/^ip=/ {{print $2; exit}}' || true)"
 [ -n "$NODE_IP" ] || NODE_IP="$(curl -fs4 --max-time 5 https://ifconfig.me 2>/dev/null || true)"
 chattr -i /etc/resolv.conf 2>/dev/null || true
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl unmask systemd-resolved 2>/dev/null || true
+fi
 rm -f /etc/resolv.conf
 printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf
 if [ -n "$NODE_IP" ]; then
@@ -2447,6 +2465,7 @@ write_public_resolv_conf() {
 backup_resolv_conf() { ensure_base_dir; if [ ! -f "$RESOLV_BACKUP" ]; then cp -a /etc/resolv.conf "$RESOLV_BACKUP" 2>/dev/null || true; fi; }
 restore_resolv_conf() {
   chattr -i /etc/resolv.conf 2>/dev/null || true
+  enable_systemd_resolved
   write_public_resolv_conf
   ok "已恢复公共 DNS: ${PUBLIC_DNS_SERVERS[*]}"
 }
@@ -2542,19 +2561,58 @@ firewall_menu() {
 }
 
 # ================= 节点机功能核心 =================
+disable_systemd_resolved() {
+  if command_exists systemctl; then
+    systemctl stop systemd-resolved 2>/dev/null || true
+    systemctl disable systemd-resolved 2>/dev/null || true
+    systemctl mask systemd-resolved 2>/dev/null || true
+  fi
+}
+
+enable_systemd_resolved() {
+  if command_exists systemctl; then
+    systemctl unmask systemd-resolved 2>/dev/null || true
+  fi
+}
+
+write_node_resolv_conf() {
+  local unlock_ip="$1"
+  chattr -i /etc/resolv.conf 2>/dev/null || true
+  chattr -i /run/systemd/resolve/stub-resolv.conf 2>/dev/null || true
+  chattr -i /run/systemd/resolve/resolv.conf 2>/dev/null || true
+  rm -f /etc/resolv.conf
+  printf 'nameserver %s\n' "$unlock_ip" > /etc/resolv.conf
+  chattr +i /etc/resolv.conf 2>/dev/null || true
+}
+
+verify_node_resolv_conf() {
+  local expected_dns="$1" actual_dns=""
+  actual_dns="$(awk '/^nameserver/ {print $2; exit}' /etc/resolv.conf 2>/dev/null)"
+  if [ -L /etc/resolv.conf ]; then
+    warn "/etc/resolv.conf 仍然是 symlink -> $(readlink /etc/resolv.conf 2>/dev/null || true)"
+  else
+    ok "/etc/resolv.conf 已切换为普通文件"
+  fi
+  if [ "$actual_dns" = "$expected_dns" ]; then
+    ok "系统首选 DNS 已写入: $actual_dns"
+  else
+    warn "系统首选 DNS 不匹配：当前 ${actual_dns:-空}，应为 $expected_dns"
+  fi
+  if command_exists systemctl && systemctl is-active systemd-resolved >/dev/null 2>&1; then
+    warn "systemd-resolved 仍在运行，可能绕过 /etc/resolv.conf"
+  else
+    ok "systemd-resolved 未运行"
+  fi
+}
+
 set_node_dns() {
   read -r -p "输入【解锁机】公网 IP: " unlock_ip
   if [ -z "$unlock_ip" ]; then warn "不能为空。"; return; fi
   backup_resolv_conf
-  if command_exists systemctl && systemctl is-active systemd-resolved >/dev/null 2>&1; then
-    systemctl stop systemd-resolved 2>/dev/null || true
-    systemctl disable systemd-resolved 2>/dev/null || true
-  fi
-  chattr -i /etc/resolv.conf 2>/dev/null || true
-  rm -f /etc/resolv.conf
-  printf 'nameserver %s\n' "$unlock_ip" > /etc/resolv.conf
-  chattr +i /etc/resolv.conf 2>/dev/null || true
+  disable_systemd_resolved
+  write_node_resolv_conf "$unlock_ip"
   ok "已设置 DNS: $unlock_ip"
+  verify_node_resolv_conf "$unlock_ip"
   info "普通域名会由解锁机 dnsmasq 转发到公共 DNS；AI 域名会解析到解锁机。"
 }
 
@@ -2565,10 +2623,29 @@ test_node_dns() {
   
   info "当前设定 DNS: $configured_dns"
   echo "--------------------------------------"
-  info "系统 DNS 配置:"
+  info "系统 DNS 接管状态:"
+  if command_exists systemctl; then
+    if systemctl is-active systemd-resolved >/dev/null 2>&1; then
+      printf "  %b systemd-resolved: active（可能绕过 /etc/resolv.conf）\n" "$(color 31 "[警告]")"
+    else
+      printf "  %b systemd-resolved: inactive\n" "$(color 32 "[正常]")"
+    fi
+  else
+    printf "  %b systemctl 不存在，跳过 systemd-resolved 状态检查\n" "$(color 33 "[跳过]")"
+  fi
   ls -l /etc/resolv.conf 2>/dev/null || true
+  if [ -L /etc/resolv.conf ]; then
+    printf "  %b /etc/resolv.conf 是 symlink -> %s\n" "$(color 31 "[警告]")" "$(readlink /etc/resolv.conf 2>/dev/null || true)"
+  else
+    printf "  %b /etc/resolv.conf 不是 symlink\n" "$(color 32 "[正常]")"
+  fi
+  printf "  %b 首个 nameserver: %s\n" "$(color 36 "[信息]")" "$configured_dns"
+  echo "--------------------------------------"
+  info "/etc/resolv.conf 实际内容:"
   cat /etc/resolv.conf 2>/dev/null || true
   if command_exists resolvectl; then
+    echo "--------------------------------------"
+    printf "\n%b\n" "$(color 36 "resolvectl status")"
     resolvectl status 2>/dev/null | sed -n '1,35p' || true
   fi
   if [ -n "$node_public_ip" ]; then
@@ -2603,6 +2680,16 @@ test_node_dns() {
   echo "--------------------------------------"
   info "系统解析测试:"
   if command_exists getent; then
+    if getent hosts example.com >/tmp/ai_unlock_getent_hosts_example.log 2>/dev/null; then
+      printf "  %b getent hosts example.com -> %s\n" "$(color 32 "[成功]")" "$(head -n 1 /tmp/ai_unlock_getent_hosts_example.log)"
+    else
+      printf "  %b getent hosts example.com -> 失败\n" "$(color 31 "[失败]")"
+    fi
+    if getent hosts chatgpt.com >/tmp/ai_unlock_getent_hosts_chatgpt.log 2>/dev/null; then
+      printf "  %b getent hosts chatgpt.com -> %s\n" "$(color 32 "[成功]")" "$(head -n 1 /tmp/ai_unlock_getent_hosts_chatgpt.log)"
+    else
+      printf "  %b getent hosts chatgpt.com -> 失败\n" "$(color 31 "[失败]")"
+    fi
     if getent ahostsv4 example.com >/tmp/ai_unlock_getent_example.log 2>/dev/null; then
       printf "  %b getent example.com -> %s\n" "$(color 32 "[成功]")" "$(head -n 1 /tmp/ai_unlock_getent_example.log)"
     else
