@@ -11,7 +11,6 @@ SNI_CONF_DIR="/etc/sniproxy/sniproxy.conf"
 SNI_DEFAULT="/etc/default/sniproxy"
 SNI_SYSTEMD_SERVICE="/etc/systemd/system/sniproxy.service"
 RESOLV_BACKUP="$BASE_DIR/resolv.conf.bak"
-UNLOCK_RESOLV_BACKUP="$BASE_DIR/unlock-resolv.conf.bak"
 FIREWALL_CHAIN="AI_UNLOCK_DNS"
 SYNC_SCRIPT="$BASE_DIR/sync_firewall.sh"
 SYSTEMD_SERVICE="/etc/systemd/system/ai-unlock-firewall.service"
@@ -1790,12 +1789,18 @@ uninstall_panel_service() {
   fi
   rm -f "$PANEL_BIN"
   rm -rf "$PANEL_WORK_DIR"
-  ok "Web 面板程序已卸载，账号、节点和域名配置已保留。"
+  rm -rf "$BASE_DIR/panel_src"
+  ok "Web 面板程序已卸载。"
 }
 
 # ================= 核心环境安装/更新 =================
 is_unlock_installed() { if [ -f "$DNSMASQ_CONF" ] && [ -f "$SNI_CONF" ]; then return 0; fi; return 1; }
 confirm_reinstall_requested() { if ! is_unlock_installed; then return 0; fi; read -r -p "检测到已安装，覆盖重装更新配置？(y/N): " confirm; case "$confirm" in y|Y) return 0 ;; *) warn "已取消。"; return 1 ;; esac; }
+require_unlock_installed() {
+  if is_unlock_installed; then return 0; fi
+  warn "请先执行【安装】完成解锁机部署。"
+  return 1
+}
 
 sanitize_domain() { printf '%s' "$1" | sed -e 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##' -e 's#^\\*\\.##' -e 's#/.*##' -e 's/:.*//'; }
 write_custom_domains() { : > "$CUSTOM_DOMAIN_FILE"; for domain in "${CUSTOM_DOMAINS[@]}"; do printf '%s\n' "$domain" >> "$CUSTOM_DOMAIN_FILE"; done; }
@@ -1885,7 +1890,6 @@ install_unlock_core() {
   if ! confirm_reinstall_requested; then return 1; fi
   
   info "环境准备与清理..."
-  backup_unlock_resolv_conf
   release_port_53
   release_port_443
 
@@ -1921,8 +1925,6 @@ uninstall_unlock_core() {
       systemctl daemon-reload 2>/dev/null || true
     fi
     remove_firewall_rules
-    restore_unlock_resolv_conf
-    if command_exists systemctl; then systemctl enable systemd-resolved 2>/dev/null || true; systemctl start systemd-resolved 2>/dev/null || true; fi
     
     rm -rf "$BASE_DIR"
     rm -f "$DNSMASQ_CONF" "$SNI_CONF" "$PANEL_BIN"
@@ -1932,7 +1934,7 @@ uninstall_unlock_core() {
     service_stop sniproxy
     release_port_443
     
-    ok "清理完毕，已恢复系统原生状态！"
+    ok "清理完毕。"
   fi
 }
 
@@ -1947,13 +1949,6 @@ restore_resolv_conf() {
   chattr -i /etc/resolv.conf 2>/dev/null || true
   write_public_resolv_conf
   ok "已恢复公共 DNS: ${PUBLIC_DNS_SERVERS[*]}"
-}
-
-backup_unlock_resolv_conf() { ensure_base_dir; if [ ! -f "$UNLOCK_RESOLV_BACKUP" ]; then cp -a /etc/resolv.conf "$UNLOCK_RESOLV_BACKUP" 2>/dev/null || true; fi; }
-restore_unlock_resolv_conf() {
-  chattr -i /etc/resolv.conf 2>/dev/null || true
-  if [ -f "$UNLOCK_RESOLV_BACKUP" ]; then cp -a "$UNLOCK_RESOLV_BACKUP" /etc/resolv.conf 2>/dev/null || true; ok "已恢复原生 DNS。"
-  else write_public_resolv_conf; fi
 }
 
 # ================= 菜单管理系统 =================
@@ -2153,12 +2148,12 @@ unlock_menu() {
     case "$choice" in
       1) install_unlock_core; pause ;;
       2) show_unlock_summary; pause ;;
-      3) show_unlock_logs; pause ;;
-      4) restart_unlock_services; pause ;;
-      5) stop_unlock_services; pause ;;
-      6) domain_menu ;;
-      7) firewall_menu ;;
-      8) panel_menu ;;
+      3) require_unlock_installed && show_unlock_logs; pause ;;
+      4) require_unlock_installed && restart_unlock_services; pause ;;
+      5) require_unlock_installed && stop_unlock_services; pause ;;
+      6) require_unlock_installed && domain_menu ;;
+      7) require_unlock_installed && firewall_menu ;;
+      8) require_unlock_installed && panel_menu ;;
       9) uninstall_unlock_core; pause ;;
       0) return ;;
       *) warn "无效选项"; sleep 1 ;;
