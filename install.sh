@@ -44,11 +44,11 @@ AI_API_CHECKS=(
   "OpenAI|api.openai.com|https://api.openai.com/v1/models|Authorization: Bearer invalid_token_test|Content-Type: application/json"
   "Anthropic|api.anthropic.com|https://api.anthropic.com/v1/models|x-api-key: invalid_token_test|anthropic-version: 2023-06-01"
   "Gemini|generativelanguage.googleapis.com|https://generativelanguage.googleapis.com/v1beta/models?key=invalid_token_test|Content-Type: application/json|"
-  "Perplexity|api.perplexity.ai|https://api.perplexity.ai/models|Authorization: Bearer invalid_token_test|Content-Type: application/json"
+  "Perplexity|api.perplexity.ai|https://api.perplexity.ai/v1/models|Accept: application/json|"
   "xAI|api.x.ai|https://api.x.ai/v1/models|Authorization: Bearer invalid_token_test|Content-Type: application/json"
-  "DeepSeek|api.deepseek.com|https://api.deepseek.com/v1/models|Authorization: Bearer invalid_token_test|Content-Type: application/json"
+  "DeepSeek|api.deepseek.com|https://api.deepseek.com/models|Authorization: Bearer invalid_token_test|Accept: application/json"
   "Mistral|api.mistral.ai|https://api.mistral.ai/v1/models|Authorization: Bearer invalid_token_test|Content-Type: application/json"
-  "OpenRouter|openrouter.ai|https://openrouter.ai/api/v1/models|Authorization: Bearer invalid_token_test|Content-Type: application/json"
+  "OpenRouter|openrouter.ai|https://openrouter.ai/api/v1/models|Accept: application/json|"
 )
 
 PUBLIC_DNS_SERVERS=("1.1.1.1" "8.8.8.8")
@@ -457,52 +457,34 @@ check_unlock_dns_forward() {
 
 check_ai_api_endpoint() {
   local server_ip="$1" name="$2" host="$3" url="$4" header1="$5" header2="$6"
-  local code body detail safe_name
-  safe_name="$(printf '%s' "$name" | tr -cd 'A-Za-z0-9_-' | tr 'A-Z' 'a-z')"
-  body="/tmp/ai_unlock_${safe_name}_api_check.log"
-  : > "$body" 2>/dev/null || true
-  if [ -n "$header2" ]; then
-    code="$(curl -k -sS --connect-timeout 5 --max-time 12 \
-      --resolve "${host}:443:${server_ip}" \
-      -H "$header1" -H "$header2" \
-      -o "$body" -w '%{http_code}' "$url" 2>/dev/null || true)"
-  else
-    code="$(curl -k -sS --connect-timeout 5 --max-time 12 \
-      --resolve "${host}:443:${server_ip}" \
-      -H "$header1" \
-      -o "$body" -w '%{http_code}' "$url" 2>/dev/null || true)"
-  fi
-  if [ -f "$body" ]; then
-    detail="$(tr '\n' ' ' < "$body" 2>/dev/null | sed 's/[[:space:]][[:space:]]*/ /g' | cut -c1-180)"
-  else
-    detail=""
-  fi
+  local code="" try
+  for try in 1 2; do
+    if [ -n "$header2" ]; then
+      code="$(curl -k -sS --connect-timeout 5 --max-time 12 \
+        --resolve "${host}:443:${server_ip}" \
+        -H "$header1" -H "$header2" \
+        -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)"
+    else
+      code="$(curl -k -sS --connect-timeout 5 --max-time 12 \
+        --resolve "${host}:443:${server_ip}" \
+        -H "$header1" \
+        -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)"
+    fi
+    [ -n "$code" ] && [ "$code" != "000" ] && break
+    sleep 1
+  done
   case "$code" in
-    400|401)
-      printf "  %b %s -> %s 无效请求/凭据（API 可达）\n" "$(color 32 "[$name通过]")" "$host" "$code"
-      return 0
-      ;;
-    403)
-      printf "  %b %s -> 403 受限/Forbidden\n" "$(color 31 "[$name受限]")" "$host"
-      [ -n "$detail" ] && printf "      %s\n" "$detail"
+    ""|000)
+      printf "  %b %-10s %s\n" "$(color 31 "[失败]")" "$name" "$host"
       return 1
       ;;
-    2*)
-      printf "  %b %s -> %s（链路可达）\n" "$(color 33 "[$name可达]")" "$host" "$code"
-      return 0
-      ;;
-    429)
-      printf "  %b %s -> 429 限流（链路可达）\n" "$(color 33 "[$name限流]")" "$host"
-      return 0
-      ;;
-    ""|000)
-      printf "  %b %s -> 连接失败\n" "$(color 31 "[$name失败]")" "$host"
+    403|451)
+      printf "  %b %-10s %s HTTP %s\n" "$(color 31 "[受限]")" "$name" "$host" "$code"
       return 1
       ;;
     *)
-      printf "  %b %s -> HTTP %s\n" "$(color 31 "[$name异常]")" "$host" "$code"
-      [ -n "$detail" ] && printf "      %s\n" "$detail"
-      return 1
+      printf "  %b %-10s %s HTTP %s\n" "$(color 32 "[可达]")" "$name" "$host" "$code"
+      return 0
       ;;
   esac
 }
@@ -518,7 +500,7 @@ EOF
       ok_count=$((ok_count + 1))
     fi
   done
-  printf "  API 判定通过项: %s/%s\n" "$ok_count" "$total"
+  printf "  可达: %s/%s\n" "$ok_count" "$total"
 }
 
 collect_ai_check_hosts() {
@@ -560,7 +542,6 @@ show_unlock_summary() {
   echo "--------------------------------------"
   FIREWALL_BACKEND="$(firewall_detect_backend)"
   printf "防火墙后端: %s (放行 IP 数: %s)\n" "$FIREWALL_BACKEND" "$([ -s "$NODE_WHITELIST_FILE" ] && wc -l < "$NODE_WHITELIST_FILE" || echo 0)"
-  info "若节点机 DNS 解析超时，必须在云服务商网页控制台开放 53 端口！"
   echo "--------------------------------------"
   printf "端口监听：\n"
   print_port_check udp 53 "dnsmasq"
@@ -577,10 +558,9 @@ show_unlock_summary() {
   done < <(collect_ai_check_hosts)
   printf "  AI 域名命中: %s/%s\n" "$dns_ok_count" "$dns_total"
   echo "--------------------------------------"
-  printf "AI API 解锁判定（无效凭据返回 400/401 表示 API 可达，403 为受限）：\n"
-  check_all_ai_api_unlock "$server_ip" || true
+  printf "AI API 连通检测：\n"
+  check_all_ai_api_unlock "127.0.0.1" || true
   echo "--------------------------------------"
-  info "这个检测看的是解锁链路；节点机仍需加入白名单，并在云安全组放行 UDP/TCP 53 与 TCP 443。"
 }
 
 show_service_status_detail() {
@@ -806,11 +786,11 @@ const API_CHECKS: &[ApiCheck] = &[
     ApiCheck { name: "OpenAI", host: "api.openai.com", url: "https://api.openai.com/v1/models", header1: "Authorization: Bearer invalid_token_test", header2: "Content-Type: application/json" },
     ApiCheck { name: "Anthropic", host: "api.anthropic.com", url: "https://api.anthropic.com/v1/models", header1: "x-api-key: invalid_token_test", header2: "anthropic-version: 2023-06-01" },
     ApiCheck { name: "Gemini", host: "generativelanguage.googleapis.com", url: "https://generativelanguage.googleapis.com/v1beta/models?key=invalid_token_test", header1: "Content-Type: application/json", header2: "" },
-    ApiCheck { name: "Perplexity", host: "api.perplexity.ai", url: "https://api.perplexity.ai/models", header1: "Authorization: Bearer invalid_token_test", header2: "Content-Type: application/json" },
+    ApiCheck { name: "Perplexity", host: "api.perplexity.ai", url: "https://api.perplexity.ai/v1/models", header1: "Accept: application/json", header2: "" },
     ApiCheck { name: "xAI", host: "api.x.ai", url: "https://api.x.ai/v1/models", header1: "Authorization: Bearer invalid_token_test", header2: "Content-Type: application/json" },
-    ApiCheck { name: "DeepSeek", host: "api.deepseek.com", url: "https://api.deepseek.com/v1/models", header1: "Authorization: Bearer invalid_token_test", header2: "Content-Type: application/json" },
+    ApiCheck { name: "DeepSeek", host: "api.deepseek.com", url: "https://api.deepseek.com/models", header1: "Authorization: Bearer invalid_token_test", header2: "Accept: application/json" },
     ApiCheck { name: "Mistral", host: "api.mistral.ai", url: "https://api.mistral.ai/v1/models", header1: "Authorization: Bearer invalid_token_test", header2: "Content-Type: application/json" },
-    ApiCheck { name: "OpenRouter", host: "openrouter.ai", url: "https://openrouter.ai/api/v1/models", header1: "Authorization: Bearer invalid_token_test", header2: "Content-Type: application/json" },
+    ApiCheck { name: "OpenRouter", host: "openrouter.ai", url: "https://openrouter.ai/api/v1/models", header1: "Accept: application/json", header2: "" },
 ];
 const BASE_DOMAINS: &[&str] = &[
     "openai.com",
@@ -1262,11 +1242,11 @@ fn dashboard_html(state: &AppState, session: &Session, host: &str, q: &HashMap<S
     let api_checks = API_CHECKS
         .iter()
         .map(|check| {
-            let ok = check_ai_api(check, &ip);
+            let ok = check_ai_api(check, "127.0.0.1");
             format!(
                 r#"<div class="check"><span class="{}">{}</span><strong>{}: {}</strong></div>"#,
                 if ok { "ok" } else { "bad" },
-                if ok { "通过" } else { "失败" },
+                if ok { "可达" } else { "失败" },
                 html(check.name),
                 html(check.host)
             )
@@ -1289,7 +1269,7 @@ fn dashboard_html(state: &AppState, session: &Session, host: &str, q: &HashMap<S
   </div>
 </section>
 <section class="glass"><div class="head"><div><h2>节点机快速使用命令</h2><p>在节点机 root 终端执行。</p></div></div><pre class="cmd">{quick}</pre></section>
-<section class="glass"><div class="head"><div><h2>AI API 解锁判定</h2><p>强制 API 连接到本机 443，无效凭据返回 400/401 计为可达，403 为受限。</p></div></div><div class="checks">{api_checks}</div></section>"#,
+<section class="glass"><div class="head"><div><h2>AI API 连通检测</h2></div></div><div class="checks">{api_checks}</div></section>"#,
         flash = flash(q),
         ip = html(&ip),
         dns = service_status("dnsmasq"),
@@ -1736,7 +1716,7 @@ fn check_ai_api(check: &ApiCheck, server_ip: &str) -> bool {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
-    code == "400" || code == "401" || code == "429" || code.starts_with('2')
+    !code.is_empty() && code != "000" && code != "403" && code != "451"
 }
 
 fn service_status(name: &str) -> String {
@@ -2361,7 +2341,7 @@ test_node_dns() {
   fi
 
   echo "--------------------------------------"
-  info "AI API 强制走解锁机判定:"
+  info "AI API 连通检测:"
   check_all_ai_api_unlock "$configured_dns" || true
 }
 
