@@ -40,15 +40,21 @@ AI_CHECK_HOSTS=(
   "meta.ai"
   "you.com"
 )
-AI_API_CHECKS=(
-  "OpenAI|api.openai.com|https://api.openai.com/v1/models|Authorization: Bearer invalid_token_test|Content-Type: application/json"
-  "Anthropic|api.anthropic.com|https://api.anthropic.com/v1/models|x-api-key: invalid_token_test|anthropic-version: 2023-06-01"
-  "Gemini|generativelanguage.googleapis.com|https://generativelanguage.googleapis.com/v1beta/models?key=invalid_token_test|Content-Type: application/json|"
-  "Perplexity|api.perplexity.ai|https://api.perplexity.ai/v1/models|Accept: application/json|"
-  "xAI|api.x.ai|https://api.x.ai/v1/models|Authorization: Bearer invalid_token_test|Content-Type: application/json"
-  "DeepSeek|api.deepseek.com|https://api.deepseek.com/models|Authorization: Bearer invalid_token_test|Accept: application/json"
-  "Mistral|api.mistral.ai|https://api.mistral.ai/v1/models|Authorization: Bearer invalid_token_test|Content-Type: application/json"
-  "OpenRouter|openrouter.ai|https://openrouter.ai/api/v1/models|Accept: application/json|"
+AI_SERVICE_CHECKS=(
+  "ChatGPT|chatgpt.com"
+  "Claude|claude.ai"
+  "Gemini|gemini.google.com"
+  "Copilot|copilot.microsoft.com"
+  "Perplexity|perplexity.ai"
+  "Grok|grok.com"
+  "Midjourney|midjourney.com"
+  "DeepSeek|deepseek.com"
+  "Mistral|mistral.ai"
+  "OpenRouter|openrouter.ai"
+  "Character.AI|character.ai"
+  "Poe|poe.com"
+  "Meta AI|meta.ai"
+  "You.com|you.com"
 )
 
 PUBLIC_DNS_SERVERS=("1.1.1.1" "8.8.8.8")
@@ -366,32 +372,6 @@ EOF
 }
 
 # ================= 连通性测试与环境检查 =================
-http_code_is_unlocked() {
-  local code="$1"
-  case "$code" in
-    2*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-print_ai_http_result() {
-  local prefix="$1" url="$2" code="$3"
-  if [ -z "$code" ] || [ "$code" = "000" ]; then
-    printf "  %b %s\n" "$(color 31 "[$prefix失败]")" "$url"
-    return 1
-  fi
-  if http_code_is_unlocked "$code"; then
-    printf "  %b %s\n" "$(color 32 "[$prefix通过]")" "$url"
-    return 0
-  fi
-  case "$code" in
-    401) printf "  %b %s\n" "$(color 33 "[$prefix需认证]")" "$url" ;;
-    3*) printf "  %b %s\n" "$(color 33 "[$prefix跳转]")" "$url" ;;
-    *) printf "  %b %s\n" "$(color 31 "[$prefix失败]")" "$url" ;;
-  esac
-  return 1
-}
-
 resolve_a_record() {
   local server="$1" domain="$2" resolved=""
   if command_exists dig; then
@@ -455,58 +435,35 @@ check_unlock_dns_forward() {
   return 0
 }
 
-check_ai_api_endpoint() {
-  local server_ip="$1" name="$2" host="$3" url="$4" header1="$5" header2="$6"
-  local code="" try
-  for try in 1 2; do
-    if [ -n "$header2" ]; then
-      code="$(curl -k -sS --connect-timeout 5 --max-time 12 \
-        --resolve "${host}:443:${server_ip}" \
-        -H "$header1" -H "$header2" \
-        -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)"
-    else
-      code="$(curl -k -sS --connect-timeout 5 --max-time 12 \
-        --resolve "${host}:443:${server_ip}" \
-        -H "$header1" \
-        -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)"
-    fi
-    [ -n "$code" ] && [ "$code" != "000" ] && break
-    sleep 1
-  done
-  case "$code" in
-    ""|000)
-      printf "  %b %s\n" "$(color 31 "[失败]")" "$name"
-      return 1
-      ;;
-    403|451)
-      printf "  %b %s\n" "$(color 31 "[受限]")" "$name"
-      return 1
-      ;;
-    *)
-      printf "  %b %s\n" "$(color 32 "[可达]")" "$name"
-      return 0
-      ;;
-  esac
+check_ai_service_endpoint() {
+  local dns_server="$1" expected_ip="$2" name="$3" host="$4" resolved
+  resolved="$(resolve_a_record "$dns_server" "$host")"
+  if [ "$resolved" = "$expected_ip" ]; then
+    printf "  %b %s\n" "$(color 32 "[通过]")" "$name"
+    return 0
+  fi
+  printf "  %b %s\n" "$(color 31 "[失败]")" "$name"
+  return 1
 }
 
-check_all_ai_api_unlock() {
-  local server_ip="$1" item name host url header1 header2 ok_count=0 total=0
-  for item in "${AI_API_CHECKS[@]}"; do
-    IFS='|' read -r name host url header1 header2 <<EOF
+check_all_ai_unlock() {
+  local dns_server="$1" expected_ip="$2" item name host ok_count=0 total=0
+  for item in "${AI_SERVICE_CHECKS[@]}"; do
+    IFS='|' read -r name host <<EOF
 $item
 EOF
     total=$((total + 1))
-    if check_ai_api_endpoint "$server_ip" "$name" "$host" "$url" "$header1" "$header2"; then
+    if check_ai_service_endpoint "$dns_server" "$expected_ip" "$name" "$host"; then
       ok_count=$((ok_count + 1))
     fi
   done
-  printf "  可达: %s/%s\n" "$ok_count" "$total"
+  printf "  通过: %s/%s\n" "$ok_count" "$total"
 }
 
 collect_ai_check_hosts() {
-  local item name host url header1 header2 seen_hosts="" check_host
-  for item in "${AI_API_CHECKS[@]}"; do
-    IFS='|' read -r name host url header1 header2 <<EOF
+  local item name host seen_hosts="" check_host
+  for item in "${AI_SERVICE_CHECKS[@]}"; do
+    IFS='|' read -r name host <<EOF
 $item
 EOF
     [ -z "$host" ] && continue
@@ -559,7 +516,7 @@ show_unlock_summary() {
   printf "  AI 域名命中: %s/%s\n" "$dns_ok_count" "$dns_total"
   echo "--------------------------------------"
   printf "AI 解锁判定：\n"
-  check_all_ai_api_unlock "127.0.0.1" || true
+  check_all_ai_unlock "127.0.0.1" "$server_ip" || true
   echo "--------------------------------------"
 }
 
@@ -770,12 +727,9 @@ use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
 
-struct ApiCheck {
+struct ServiceCheck {
     name: &'static str,
     host: &'static str,
-    url: &'static str,
-    header1: &'static str,
-    header2: &'static str,
 }
 
 const BASE_DIR: &str = "/etc/ai_unlock";
@@ -794,15 +748,21 @@ const SNI_SYSTEMD_SERVICE: &str = "/etc/systemd/system/sniproxy.service";
 const FIREWALL_CHAIN: &str = "AI_UNLOCK_DNS";
 const DEFAULT_PORT: u16 = 8088;
 const PUBLIC_DNS: &[&str] = &["1.1.1.1", "8.8.8.8"];
-const API_CHECKS: &[ApiCheck] = &[
-    ApiCheck { name: "OpenAI", host: "api.openai.com", url: "https://api.openai.com/v1/models", header1: "Authorization: Bearer invalid_token_test", header2: "Content-Type: application/json" },
-    ApiCheck { name: "Anthropic", host: "api.anthropic.com", url: "https://api.anthropic.com/v1/models", header1: "x-api-key: invalid_token_test", header2: "anthropic-version: 2023-06-01" },
-    ApiCheck { name: "Gemini", host: "generativelanguage.googleapis.com", url: "https://generativelanguage.googleapis.com/v1beta/models?key=invalid_token_test", header1: "Content-Type: application/json", header2: "" },
-    ApiCheck { name: "Perplexity", host: "api.perplexity.ai", url: "https://api.perplexity.ai/v1/models", header1: "Accept: application/json", header2: "" },
-    ApiCheck { name: "xAI", host: "api.x.ai", url: "https://api.x.ai/v1/models", header1: "Authorization: Bearer invalid_token_test", header2: "Content-Type: application/json" },
-    ApiCheck { name: "DeepSeek", host: "api.deepseek.com", url: "https://api.deepseek.com/models", header1: "Authorization: Bearer invalid_token_test", header2: "Accept: application/json" },
-    ApiCheck { name: "Mistral", host: "api.mistral.ai", url: "https://api.mistral.ai/v1/models", header1: "Authorization: Bearer invalid_token_test", header2: "Content-Type: application/json" },
-    ApiCheck { name: "OpenRouter", host: "openrouter.ai", url: "https://openrouter.ai/api/v1/models", header1: "Accept: application/json", header2: "" },
+const SERVICE_CHECKS: &[ServiceCheck] = &[
+    ServiceCheck { name: "ChatGPT", host: "chatgpt.com" },
+    ServiceCheck { name: "Claude", host: "claude.ai" },
+    ServiceCheck { name: "Gemini", host: "gemini.google.com" },
+    ServiceCheck { name: "Copilot", host: "copilot.microsoft.com" },
+    ServiceCheck { name: "Perplexity", host: "perplexity.ai" },
+    ServiceCheck { name: "Grok", host: "grok.com" },
+    ServiceCheck { name: "Midjourney", host: "midjourney.com" },
+    ServiceCheck { name: "DeepSeek", host: "deepseek.com" },
+    ServiceCheck { name: "Mistral", host: "mistral.ai" },
+    ServiceCheck { name: "OpenRouter", host: "openrouter.ai" },
+    ServiceCheck { name: "Character.AI", host: "character.ai" },
+    ServiceCheck { name: "Poe", host: "poe.com" },
+    ServiceCheck { name: "Meta AI", host: "meta.ai" },
+    ServiceCheck { name: "You.com", host: "you.com" },
 ];
 const BASE_DOMAINS: &[&str] = &[
     "openai.com",
@@ -1337,14 +1297,14 @@ async fn node_join(State(state): State<Arc<AppState>>, Query(q): Query<HashMap<S
 fn dashboard_html(state: &AppState, session: &Session, host: &str, q: &HashMap<String, String>) -> String {
     let ip = detect_public_ip();
     let nodes = load_nodes().unwrap_or_default();
-    let api_checks = API_CHECKS
+    let service_checks = SERVICE_CHECKS
         .iter()
         .map(|check| {
-            let ok = check_ai_api(check, "127.0.0.1");
+            let ok = check_ai_service(check, "127.0.0.1", &ip);
             format!(
                 r#"<div class="check"><span class="{}">{}</span><strong>{}</strong></div>"#,
                 if ok { "ok" } else { "bad" },
-                if ok { "可达" } else { "失败" },
+                if ok { "通过" } else { "失败" },
                 html(check.name)
             )
         })
@@ -1365,7 +1325,7 @@ fn dashboard_html(state: &AppState, session: &Session, host: &str, q: &HashMap<S
     <form method="post" action="/action/stop"><input type="hidden" name="csrf" value="{csrf}"><button class="danger">暂停服务</button></form>
   </div>
 </section>
-<section class="glass"><div class="head"><div><h2>AI 解锁判定</h2></div></div><div class="checks">{api_checks}</div></section>"#,
+<section class="glass"><div class="head"><div><h2>AI 解锁判定</h2></div></div><div class="checks">{service_checks}</div></section>"#,
         flash = flash(q),
         ip = html(&ip),
         dns = service_status("dnsmasq"),
@@ -1374,7 +1334,7 @@ fn dashboard_html(state: &AppState, session: &Session, host: &str, q: &HashMap<S
         sni_cls = if service_status("sniproxy") == "active" { "ok" } else { "bad" },
         count = nodes.len(),
         csrf = html(&session.csrf),
-        api_checks = api_checks
+        service_checks = service_checks
     )
 }
 
@@ -1892,35 +1852,36 @@ fn detect_public_ip() -> String {
     output("sh", &["-c", "hostname -I 2>/dev/null | awk '{print $1}'"])
 }
 
-fn check_ai_api(check: &ApiCheck, server_ip: &str) -> bool {
-    if server_ip.is_empty() {
+fn check_ai_service(check: &ServiceCheck, dns_server: &str, expected_ip: &str) -> bool {
+    if dns_server.is_empty() || expected_ip.is_empty() {
         return false;
     }
-    let resolve = format!("{}:443:{server_ip}", check.host);
-    let mut command = Command::new("curl");
-    command.args([
-        "-k",
-        "-sS",
-        "--connect-timeout",
-        "5",
-        "--max-time",
-        "12",
-        "--resolve",
-        resolve.as_str(),
-        "-H",
-        check.header1,
-    ]);
-    if !check.header2.is_empty() {
-        command.args(["-H", check.header2]);
+    resolve_a_record(dns_server, check.host) == expected_ip
+}
+
+fn resolve_a_record(server: &str, host: &str) -> String {
+    if command_exists("dig") {
+        let server_arg = format!("@{server}");
+        let raw = output("dig", &[server_arg.as_str(), host, "A", "+time=2", "+tries=1", "+short"]);
+        let ip = first_ipv4(&raw);
+        if !ip.is_empty() {
+            return ip;
+        }
     }
-    command.args(["-o", "/dev/null", "-w", "%{http_code}", check.url]);
-    let code = command
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
-    !code.is_empty() && code != "000" && code != "403" && code != "451"
+    if command_exists("nslookup") {
+        let raw = output("nslookup", &["-type=A", host, server]);
+        return first_ipv4(&raw);
+    }
+    String::new()
+}
+
+fn first_ipv4(raw: &str) -> String {
+    raw.lines()
+        .filter(|line| !line.trim_start().starts_with("Server:"))
+        .flat_map(str::split_whitespace)
+        .find(|part| valid_ip(part.trim()))
+        .map(|part| part.trim().to_string())
+        .unwrap_or_default()
 }
 
 fn service_status(name: &str) -> String {
@@ -2546,7 +2507,7 @@ test_node_dns() {
 
   echo "--------------------------------------"
   info "AI 解锁判定:"
-  check_all_ai_api_unlock "$configured_dns" || true
+  check_all_ai_unlock "$configured_dns" "$configured_dns" || true
 }
 
 unlock_menu() {
