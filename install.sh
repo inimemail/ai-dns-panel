@@ -885,11 +885,11 @@ async fn main() -> io::Result<()> {
         .route("/domains/clear", post(domains_clear))
         .route("/settings/update", post(settings_update))
         .route("/action/update", post(action_update))
-        .route("/action/sync", post(action_sync))
         .route("/action/stop", post(action_stop))
         .route("/node.sh", get(node_script))
         .route("/node-uninstall.sh", get(node_uninstall_script))
         .route("/node-join", get(node_join))
+        .route("/node-leave", get(node_leave))
         .layer(CookieManagerLayer::new())
         .with_state(state);
 
@@ -1189,10 +1189,6 @@ async fn action_update(State(state): State<Arc<AppState>>, cookies: Cookies, For
     action_guard(&state, &cookies, &form, || update_rules())
 }
 
-async fn action_sync(State(state): State<Arc<AppState>>, cookies: Cookies, Form(form): Form<HashMap<String, String>>) -> Response {
-    action_guard(&state, &cookies, &form, || sync_firewall(&load_nodes().unwrap_or_default()))
-}
-
 async fn action_stop(State(state): State<Arc<AppState>>, cookies: Cookies, Form(form): Form<HashMap<String, String>>) -> Response {
     action_guard(&state, &cookies, &form, || {
         run_ignore("systemctl", &["stop", "dnsmasq"]);
@@ -1250,19 +1246,29 @@ echo "节点机 DNS 已指向 $UNLOCK_IP"
     ([(axum::http::header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")], body).into_response()
 }
 
-async fn node_uninstall_script(State(state): State<Arc<AppState>>, Query(q): Query<HashMap<String, String>>) -> Response {
+async fn node_uninstall_script(State(state): State<Arc<AppState>>, headers: HeaderMap, Query(q): Query<HashMap<String, String>>) -> Response {
     let token = q.get("token").map(String::as_str).unwrap_or("");
     if !join_token_ok(&state, token) {
         return (StatusCode::FORBIDDEN, "forbidden").into_response();
     }
-    let body = r#"#!/bin/bash
+    let panel = panel_base_url(&headers, state.port);
+    let body = format!(
+        r#"#!/bin/bash
 set -e
 [ "$EUID" -ne 0 ] && echo "请使用 root 权限运行" && exit 1
+PANEL_URL="{panel}"
+TOKEN="{token}"
+NODE_IP="$(curl -k -fs4 --max-time 5 https://1.1.1.1/cdn-cgi/trace 2>/dev/null | awk -F= '/^ip=/ {{print $2; exit}}' || true)"
+[ -n "$NODE_IP" ] || NODE_IP="$(curl -fs4 --max-time 5 https://ifconfig.me 2>/dev/null || true)"
 chattr -i /etc/resolv.conf 2>/dev/null || true
 rm -f /etc/resolv.conf
 printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf
+if [ -n "$NODE_IP" ]; then
+  curl -fsS --max-time 8 "$PANEL_URL/node-leave?token=$TOKEN&ip=$NODE_IP" >/dev/null 2>&1 || true
+fi
 echo "节点机 DNS 已恢复为 1.1.1.1 / 8.8.8.8"
-"#;
+"#
+    );
     ([(axum::http::header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")], body).into_response()
 }
 
@@ -1294,6 +1300,21 @@ async fn node_join(State(state): State<Arc<AppState>>, Query(q): Query<HashMap<S
     "ok".into_response()
 }
 
+async fn node_leave(State(state): State<Arc<AppState>>, Query(q): Query<HashMap<String, String>>) -> Response {
+    let token = q.get("token").map(String::as_str).unwrap_or("");
+    if !join_token_ok(&state, token) {
+        return (StatusCode::FORBIDDEN, "forbidden").into_response();
+    }
+    let ip = q.get("ip").map(String::as_str).unwrap_or("").trim();
+    if !valid_ip(ip) {
+        return (StatusCode::BAD_REQUEST, "bad ip").into_response();
+    }
+    let mut nodes = load_nodes().unwrap_or_default();
+    nodes.retain(|n| n.ip != ip);
+    let _ = save_nodes(&nodes, true);
+    "ok".into_response()
+}
+
 fn dashboard_html(state: &AppState, session: &Session, host: &str, q: &HashMap<String, String>) -> String {
     let ip = detect_public_ip();
     let nodes = load_nodes().unwrap_or_default();
@@ -1318,10 +1339,9 @@ fn dashboard_html(state: &AppState, session: &Session, host: &str, q: &HashMap<S
   <div class="metric"><span>白名单节点</span><strong>{count}</strong></div>
 </section>
 <section class="glass">
-  <div class="head"><div><h2>快捷操作</h2><p>规则、白名单和服务控制。</p></div></div>
-  <div class="actions">
-    <form method="post" action="/action/update"><input type="hidden" name="csrf" value="{csrf}"><button>重新生成规则</button></form>
-    <form method="post" action="/action/sync"><input type="hidden" name="csrf" value="{csrf}"><button>同步白名单</button></form>
+  <div class="head"><div><h2>快捷操作</h2><p>规则和服务控制。</p></div></div>
+  <div class="actions quick-actions">
+    <form method="post" action="/action/update"><input type="hidden" name="csrf" value="{csrf}"><button>重载规则</button></form>
     <form method="post" action="/action/stop"><input type="hidden" name="csrf" value="{csrf}"><button class="danger">暂停服务</button></form>
   </div>
 </section>
@@ -1367,7 +1387,7 @@ fn nodes_html(session: &Session, nodes: &[Node], q: &HashMap<String, String>, ho
   <button class="copy-command ghost danger" data-token="{token}" data-template="{uninstall_cmd}">复制卸载命令</button>
 </div></section>
 <section class="grid split">
-  <div class="glass"><div class="head"><div><h2>添加节点</h2><p>添加后自动同步白名单。</p></div></div><form class="stack" method="post" action="/nodes/add"><input type="hidden" name="csrf" value="{csrf}"><label>节点公网 IP<input name="ip" required placeholder="1.2.3.4"></label><label>名称<input name="name"></label><label>备注<input name="note"></label><button>添加节点</button></form></div>
+  <div class="glass"><div class="head"><div><h2>添加节点</h2><p>添加后自动应用放行规则。</p></div></div><form class="stack" method="post" action="/nodes/add"><input type="hidden" name="csrf" value="{csrf}"><label>节点公网 IP<input name="ip" required placeholder="1.2.3.4"></label><label>名称<input name="name"></label><label>备注<input name="note"></label><button>添加节点</button></form></div>
   <div class="glass"><div class="head"><div><h2>批量添加</h2><p>每行一个 IP，可跟名称。</p></div></div><form class="stack" method="post" action="/nodes/batch-add"><input type="hidden" name="csrf" value="{csrf}"><textarea name="items" rows="7" placeholder="1.2.3.4 节点A&#10;5.6.7.8 节点B"></textarea><button>批量添加</button></form></div>
 </section>
 <section class="glass"><div class="head"><div><h2>节点列表</h2><p>共 {count} 个。</p></div></div><div class="table"><table><thead><tr><th>IP</th><th>编辑</th><th>添加时间</th><th></th></tr></thead><tbody>{rows}</tbody></table></div></section>
@@ -2020,7 +2040,7 @@ fn shell_word(input: &str) -> String {
 
 const CSS: &str = r#"
 :root{--primary:#3b82f6;--danger:#ef4444;--success:#10b981;--warn:#d97706;--ink:#374151;--muted:#6b7280}
-*{box-sizing:border-box}body{margin:0;min-height:100vh;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--ink);background:#e9eef6;letter-spacing:0}.bg{position:fixed;inset:0;z-index:-1;background:linear-gradient(135deg,#d8e6f7 0%,#eef2f7 45%,#d7efe7 100%)}.nav{position:sticky;top:0;z-index:10;background:rgba(255,255,255,.82);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);border-bottom:1px solid rgba(209,213,219,.75);padding:12px 28px;display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:16px}.brand{font-weight:800;font-size:18px}.nav nav{display:flex;gap:8px;justify-content:center;flex-wrap:wrap}.nav a{color:var(--ink);text-decoration:none;border-radius:10px;padding:8px 11px}.nav a:hover{background:rgba(255,255,255,.72)}.wrap{width:min(1180px,94vw);margin:24px auto 40px;display:grid;gap:18px}.page-title h1{margin:0;font-size:28px}.grid{display:grid;gap:16px}.metrics{grid-template-columns:repeat(4,minmax(0,1fr))}.split{grid-template-columns:repeat(2,minmax(0,1fr))}.glass,.metric,.login-box{background:rgba(255,255,255,.46);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,.62);border-radius:14px;box-shadow:0 8px 30px rgba(31,41,55,.06);padding:20px}.metric span{display:block;color:var(--muted);font-size:13px}.metric strong{display:block;margin-top:6px;font-size:24px;overflow-wrap:anywhere}.head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:15px}.head h2{margin:0;font-size:18px}.head p{margin:3px 0 0;color:var(--muted)}button{border:0;border-radius:10px;background:rgba(59,130,246,.9);color:white;padding:10px 15px;font-weight:700;cursor:pointer;white-space:nowrap}button:hover{filter:brightness(.96);transform:translateY(-1px)}button.danger,.danger{background:rgba(239,68,68,.9);color:white}button.ghost,.ghost{background:rgba(255,255,255,.65);color:var(--ink)}.actions{display:flex;gap:10px;flex-wrap:wrap}input,textarea{width:100%;border:1px solid rgba(255,255,255,.55);background:rgba(255,255,255,.62);border-radius:10px;padding:11px 12px;color:var(--ink);outline:none}input:focus,textarea:focus{background:rgba(255,255,255,.86);border-color:#93c5fd}textarea{resize:vertical}.stack{display:grid;gap:12px}label{display:grid;gap:6px;color:var(--muted)}.row{display:grid;grid-template-columns:1fr auto;gap:10px}.inline{display:grid;grid-template-columns:135px 1fr 1fr auto;gap:8px}.table{overflow:auto}table{width:100%;border-collapse:separate;border-spacing:0 10px}th{color:var(--muted);text-align:left;font-size:13px;padding:0 10px}td{background:rgba(255,255,255,.42);padding:10px;border-top:1px solid rgba(255,255,255,.44);border-bottom:1px solid rgba(255,255,255,.44)}td:first-child{border-left:1px solid rgba(255,255,255,.44);border-radius:12px 0 0 12px}td:last-child{border-right:1px solid rgba(255,255,255,.44);border-radius:0 12px 12px 0}code,.cmd{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.cmd{margin:0;background:rgba(15,23,42,.88);color:#eef6ff;border-radius:12px;padding:15px;white-space:pre-wrap;overflow:auto}.checks{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.check{display:flex;align-items:center;justify-content:space-between;gap:12px;background:rgba(255,255,255,.46);border:1px solid rgba(255,255,255,.52);border-radius:12px;padding:10px 12px}.check strong{overflow-wrap:anywhere;text-align:right}.ok{color:var(--success)}.bad{color:var(--danger)}.warn{color:var(--warn)}.muted{color:var(--muted)}.alert{border-radius:12px;padding:11px 13px;background:rgba(255,255,255,.58);border:1px solid rgba(255,255,255,.65)}.alert.ok{color:#047857}.alert.bad{color:#b91c1c}.pills{display:flex;flex-wrap:wrap;gap:8px}.pill{background:rgba(255,255,255,.45);border:1px solid rgba(255,255,255,.55);border-radius:999px;padding:7px 11px}.domain{display:flex;align-items:center;justify-content:space-between;background:rgba(255,255,255,.42);border:1px solid rgba(255,255,255,.5);border-radius:12px;padding:10px 12px;margin-bottom:8px}.modal-backdrop{position:fixed;inset:0;z-index:50;display:grid;place-items:center;padding:20px;background:rgba(15,23,42,.32);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}.modal-backdrop[hidden]{display:none}.settings-modal{width:min(440px,92vw);display:grid;gap:14px;background:rgba(255,255,255,.9);border:1px solid rgba(255,255,255,.75);border-radius:14px;box-shadow:0 20px 60px rgba(15,23,42,.18);padding:20px}.settings-modal form{margin:0}.login{min-height:100vh;display:grid;place-items:center;padding:24px}.login-box{width:min(390px,92vw);display:grid;gap:16px;text-align:left}.login-box h1{margin:0;font-size:28px}.login-box p{margin:0;color:var(--muted)}@media(max-width:780px){.nav{position:sticky;grid-template-columns:1fr auto;grid-template-areas:"brand settings" "links links";gap:8px;padding:10px 14px}.brand{grid-area:brand}.settings-toggle{grid-area:settings}.nav nav{grid-area:links;justify-content:flex-start;gap:6px;overflow-x:auto;flex-wrap:nowrap;padding-bottom:2px}.nav a{padding:7px 9px;white-space:nowrap}.nav button{padding:7px 10px}.modal-backdrop{align-items:flex-start;padding-top:70px}.settings-modal{max-height:calc(100vh - 96px);overflow:auto}.wrap{margin:16px auto;width:94vw}.page-title h1{font-size:22px}.metrics,.split,.checks{grid-template-columns:1fr}.inline{grid-template-columns:1fr}.actions button{flex:1;min-width:138px}.head p{display:none}.check{min-height:48px}.check span{min-width:42px}th{display:none}tr,td{display:block}td{border:0!important;border-radius:0!important}td:first-child{border-radius:12px 12px 0 0!important}td:last-child{border-radius:0 0 12px 12px!important}}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--ink);background:#e9eef6;letter-spacing:0}.bg{position:fixed;inset:0;z-index:-1;background:linear-gradient(135deg,#d8e6f7 0%,#eef2f7 45%,#d7efe7 100%)}.nav{position:sticky;top:0;z-index:10;background:rgba(255,255,255,.82);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);border-bottom:1px solid rgba(209,213,219,.75);padding:8px 20px;display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:10px}.brand{font-weight:800;font-size:16px;white-space:nowrap}.nav nav{display:flex;gap:6px;justify-content:center;flex-wrap:nowrap;overflow-x:auto}.nav a{color:var(--ink);text-decoration:none;border-radius:8px;padding:6px 8px;white-space:nowrap;font-size:14px}.nav a:hover{background:rgba(255,255,255,.72)}.wrap{width:min(1180px,94vw);margin:24px auto 40px;display:grid;gap:18px}.page-title h1{margin:0;font-size:28px}.grid{display:grid;gap:16px}.metrics{grid-template-columns:repeat(4,minmax(0,1fr))}.split{grid-template-columns:repeat(2,minmax(0,1fr))}.glass,.metric,.login-box{background:rgba(255,255,255,.46);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,.62);border-radius:14px;box-shadow:0 8px 30px rgba(31,41,55,.06);padding:20px}.metric span{display:block;color:var(--muted);font-size:13px}.metric strong{display:block;margin-top:6px;font-size:24px;overflow-wrap:anywhere}.head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:15px}.head h2{margin:0;font-size:18px}.head p{margin:3px 0 0;color:var(--muted)}button{border:0;border-radius:10px;background:rgba(59,130,246,.9);color:white;padding:10px 15px;font-weight:700;cursor:pointer;white-space:nowrap}button:hover{filter:brightness(.96);transform:translateY(-1px)}button.danger,.danger{background:rgba(239,68,68,.9);color:white}button.ghost,.ghost{background:rgba(255,255,255,.65);color:var(--ink)}.nav button{padding:6px 9px}.actions{display:flex;gap:10px;flex-wrap:wrap}.actions form{margin:0}input,textarea{width:100%;border:1px solid rgba(255,255,255,.55);background:rgba(255,255,255,.62);border-radius:10px;padding:11px 12px;color:var(--ink);outline:none}input:focus,textarea:focus{background:rgba(255,255,255,.86);border-color:#93c5fd}textarea{resize:vertical}.stack{display:grid;gap:12px}label{display:grid;gap:6px;color:var(--muted)}.row{display:grid;grid-template-columns:1fr auto;gap:10px}.inline{display:grid;grid-template-columns:135px 1fr 1fr auto;gap:8px}.table{overflow:auto}table{width:100%;border-collapse:separate;border-spacing:0 10px}th{color:var(--muted);text-align:left;font-size:13px;padding:0 10px}td{background:rgba(255,255,255,.42);padding:10px;border-top:1px solid rgba(255,255,255,.44);border-bottom:1px solid rgba(255,255,255,.44)}td:first-child{border-left:1px solid rgba(255,255,255,.44);border-radius:12px 0 0 12px}td:last-child{border-right:1px solid rgba(255,255,255,.44);border-radius:0 12px 12px 0}code,.cmd{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.cmd{margin:0;background:rgba(15,23,42,.88);color:#eef6ff;border-radius:12px;padding:15px;white-space:pre-wrap;overflow:auto}.checks{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.check{display:flex;align-items:center;justify-content:space-between;gap:12px;background:rgba(255,255,255,.46);border:1px solid rgba(255,255,255,.52);border-radius:12px;padding:10px 12px}.check strong{overflow-wrap:anywhere;text-align:right}.ok{color:var(--success)}.bad{color:var(--danger)}.warn{color:var(--warn)}.muted{color:var(--muted)}.alert{border-radius:12px;padding:11px 13px;background:rgba(255,255,255,.58);border:1px solid rgba(255,255,255,.65)}.alert.ok{color:#047857}.alert.bad{color:#b91c1c}.pills{display:flex;flex-wrap:wrap;gap:8px}.pill{background:rgba(255,255,255,.45);border:1px solid rgba(255,255,255,.55);border-radius:999px;padding:7px 11px}.domain{display:flex;align-items:center;justify-content:space-between;background:rgba(255,255,255,.42);border:1px solid rgba(255,255,255,.5);border-radius:12px;padding:10px 12px;margin-bottom:8px}.modal-backdrop{position:fixed;inset:0;z-index:50;display:grid;place-items:center;padding:20px;background:rgba(15,23,42,.32);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}.modal-backdrop[hidden]{display:none}.settings-modal{width:min(440px,92vw);display:grid;gap:14px;background:rgba(255,255,255,.9);border:1px solid rgba(255,255,255,.75);border-radius:14px;box-shadow:0 20px 60px rgba(15,23,42,.18);padding:20px}.settings-modal form{margin:0}.login{min-height:100vh;display:grid;place-items:center;padding:24px}.login-box{width:min(390px,92vw);display:grid;gap:16px;text-align:left}.login-box h1{margin:0;font-size:28px}.login-box p{margin:0;color:var(--muted)}@media(max-width:780px){.nav{position:sticky;grid-template-columns:auto minmax(0,1fr) auto;gap:6px;padding:7px 10px}.brand{font-size:15px}.nav nav{justify-content:flex-start;gap:4px;overflow-x:auto;flex-wrap:nowrap;padding-bottom:0}.nav a{padding:5px 6px;font-size:13px}.nav button{padding:5px 7px;font-size:13px}.modal-backdrop{align-items:flex-start;padding-top:58px}.settings-modal{max-height:calc(100vh - 80px);overflow:auto}.wrap{margin:16px auto;width:94vw}.page-title h1{font-size:22px}.metrics,.split,.checks{grid-template-columns:1fr}.inline{grid-template-columns:1fr}.actions button{flex:1;min-width:138px}.quick-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.quick-actions form{min-width:0}.quick-actions button{width:100%;min-width:0!important;padding:8px 5px;font-size:13px}.head p{display:none}.check{min-height:48px}.check span{min-width:42px}th{display:none}tr,td{display:block}td{border:0!important;border-radius:0!important}td:first-child{border-radius:12px 12px 0 0!important}td:last-child{border-radius:0 0 12px 12px!important}}
 "#;
 AI_UNLOCK_PANEL_MAIN_EOF
   printf '%s
