@@ -468,25 +468,10 @@ http_code_is_reachable() {
   esac
 }
 
-resolve_public_a_record() {
-  local host="$1" dns resolved=""
-  for dns in "${PUBLIC_DNS_SERVERS[@]}"; do
-    resolved="$(resolve_a_record "$dns" "$host")"
-    [ -n "$resolved" ] && printf '%s\n' "$resolved" && return 0
-  done
-  if command_exists getent; then
-    resolved="$(getent ahostsv4 "$host" 2>/dev/null | awk '/STREAM/ {print $1; exit}')"
-    [ -n "$resolved" ] && printf '%s\n' "$resolved" && return 0
-  fi
-  return 1
-}
-
 curl_ai_direct_egress() {
-  local host="$1" ip
+  local host="$1"
   shift
-  ip="$(resolve_public_a_record "$host")" || return 7
-  [ -z "$ip" ] && return 7
-  curl -k -sS -L --connect-timeout 6 --max-time 18 --resolve "${host}:443:${ip}" -H "User-Agent: Mozilla/5.0" "$@"
+  curl -k -sS -L --connect-timeout 6 --max-time 18 -H "User-Agent: Mozilla/5.0" "$@"
 }
 
 print_ai_unlock_status() {
@@ -498,37 +483,39 @@ print_ai_unlock_status() {
   esac
 }
 
-check_chatgpt_web_unlock() {
-  local res code url trace loc colo
-  res="$(curl_ai_direct_egress "chat.openai.com" -o /dev/null -w '%{http_code}:%{url_effective}' "https://chat.openai.com/" 2>/dev/null || true)"
-  code="${res%%:*}"
-  url="${res#*:}"
-  if echo "$url" | grep -Eqi 'sorry|blocked|unsupported_country' || [ "$code" = "403" ]; then
-    print_ai_unlock_status "ChatGPT Web" no "地区不支持"
-  elif [ "$code" = "200" ] || [ "$code" = "307" ]; then
-    trace="$(curl_ai_direct_egress "chat.openai.com" "https://chat.openai.com/cdn-cgi/trace" 2>/dev/null || true)"
-    loc="$(printf '%s\n' "$trace" | awk -F= '/^loc=/ {print $2; exit}')"
-    colo="$(printf '%s\n' "$trace" | awk -F= '/^colo=/ {print $2; exit}')"
-    print_ai_unlock_status "ChatGPT Web" ok "可访问${loc:+（出口: $loc${colo:+/$colo}）}"
-  elif [ -z "$code" ] || [ "$code" = "000" ]; then
-    print_ai_unlock_status "ChatGPT Web" err "网络连接失败"
-  else
-    print_ai_unlock_status "ChatGPT Web" err "检测失败 HTTP $code"
-  fi
-}
+check_chatgpt_unlock() {
+  local api_res ios_res favicon_code trace loc colo api_block="" ios_block=""
+  api_res="$(curl_ai_direct_egress "api.openai.com" "https://api.openai.com/compliance/cookie_requirements" 2>/dev/null || true)"
+  ios_res="$(curl_ai_direct_egress "ios.chat.openai.com" "https://ios.chat.openai.com/" 2>/dev/null || true)"
+  favicon_code="$(curl_ai_direct_egress "chatgpt.com" -o /dev/null -w '%{http_code}' "https://chatgpt.com/favicon.ico" 2>/dev/null || true)"
+  trace="$(curl_ai_direct_egress "chat.openai.com" "https://chat.openai.com/cdn-cgi/trace" 2>/dev/null || true)"
+  loc="$(printf '%s\n' "$trace" | awk -F= '/^loc=/ {print $2; exit}')"
+  colo="$(printf '%s\n' "$trace" | awk -F= '/^colo=/ {print $2; exit}')"
 
-check_openai_api_unlock() {
-  local api_res
-  api_res="$(curl_ai_direct_egress "api.openai.com" "https://api.openai.com/v1/models" 2>/dev/null || true)"
-  if echo "$api_res" | grep -Eqi 'unsupported_country|country_not_supported'; then
-    print_ai_unlock_status "OpenAI API" no "地区不支持"
-  elif echo "$api_res" | grep -Eqi '"data"[[:space:]]*:[[:space:]]*\['; then
-    print_ai_unlock_status "OpenAI API" ok "可访问"
-  elif echo "$api_res" | grep -qi 'invalid_api_key'; then
-    print_ai_unlock_status "OpenAI API" ok "可访问（需要 API Key）"
-  else
-    print_ai_unlock_status "OpenAI API" err "检测失败"
+  echo "$api_res" | grep -Eqi 'unsupported_country|country_not_supported' && api_block=1
+  echo "$ios_res" | grep -Eqi 'VPN|unsupported_country|country_not_supported|not available' && ios_block=1
+  if [ -n "$api_block" ] && [ -n "$favicon_code" ] && [ "$favicon_code" != "000" ] && [ "$favicon_code" != "403" ]; then
+    api_block=""
   fi
+
+  if [ -z "$api_res" ] && [ -z "$ios_res" ] && { [ -z "$favicon_code" ] || [ "$favicon_code" = "000" ]; }; then
+    print_ai_unlock_status "ChatGPT" err "网络连接失败"
+    return 1
+  fi
+  if [ -n "$api_block" ] && [ -n "$ios_block" ]; then
+    print_ai_unlock_status "ChatGPT" no "地区不支持"
+    return 1
+  fi
+  if [ -n "$ios_block" ]; then
+    print_ai_unlock_status "ChatGPT" ok "仅网页可用${loc:+（出口: $loc${colo:+/$colo}）}"
+    return 0
+  fi
+  if [ -n "$api_block" ]; then
+    print_ai_unlock_status "ChatGPT" ok "仅 App/API 受限${loc:+（出口: $loc${colo:+/$colo}）}"
+    return 0
+  fi
+  print_ai_unlock_status "ChatGPT" ok "可访问${loc:+（出口: $loc${colo:+/$colo}）}"
+  return 0
 }
 
 check_ai_page_unlock() {
@@ -547,27 +534,6 @@ check_ai_page_unlock() {
   case " $ok_codes " in
     *" $code "*)
       print_ai_unlock_status "$name" ok "可访问"
-      return 0
-      ;;
-  esac
-  print_ai_unlock_status "$name" err "检测失败 HTTP $code"
-  return 1
-}
-
-check_ai_api_unlock() {
-  local name="$1" host="$2" api_url="$3" ok_codes="$4" no_code="$5" ok_text="$6" no_text="$7" code
-  code="$(curl_ai_direct_egress "$host" -o /dev/null -w '%{http_code}' "$api_url" 2>/dev/null || true)"
-  if [ -z "$code" ] || [ "$code" = "000" ]; then
-    print_ai_unlock_status "$name" err "网络连接失败"
-    return 1
-  fi
-  if [ "$code" = "$no_code" ]; then
-    print_ai_unlock_status "$name" no "$no_text"
-    return 1
-  fi
-  case " $ok_codes " in
-    *" $code "*)
-      print_ai_unlock_status "$name" ok "$ok_text"
       return 0
       ;;
   esac
@@ -610,43 +576,23 @@ check_copilot_unlock() {
 }
 
 check_grok_unlock() {
-  if check_ai_page_unlock "Grok" "grok.com" "https://grok.com/" "200 301 302" "blocked|geo|unavailable|sorry"; then
-    check_ai_api_unlock "Grok API" "api.x.ai" "https://api.x.ai/v1/models" "200 401" "403" "可访问（API 需认证）" "API 地区受限" || true
-    return 0
-  fi
-  return 1
+  check_ai_page_unlock "Grok" "grok.com" "https://grok.com/" "200 301 302" "blocked|geo|unavailable|sorry"
 }
 
 check_mistral_unlock() {
-  if check_ai_page_unlock "Mistral" "chat.mistral.ai" "https://chat.mistral.ai/" "200 301 302" "blocked|geo|unavailable|sorry"; then
-    check_ai_api_unlock "Mistral API" "api.mistral.ai" "https://api.mistral.ai/v1/models" "200 401" "403" "可访问（API 需认证）" "API 地区受限" || true
-    return 0
-  fi
-  return 1
+  check_ai_page_unlock "Mistral" "chat.mistral.ai" "https://chat.mistral.ai/" "200 301 302" "blocked|geo|unavailable|sorry"
 }
 
 check_deepseek_unlock() {
-  if check_ai_page_unlock "DeepSeek" "chat.deepseek.com" "https://chat.deepseek.com/" "200 301 302" "blocked|geo|unavailable|sorry"; then
-    check_ai_api_unlock "DeepSeek API" "api.deepseek.com" "https://api.deepseek.com/v1/models" "200 401" "403" "可访问（API 需认证）" "API 地区受限" || true
-    return 0
-  fi
-  return 1
+  check_ai_page_unlock "DeepSeek" "chat.deepseek.com" "https://chat.deepseek.com/" "200 301 302" "blocked|geo|unavailable|sorry"
 }
 
 check_character_unlock() {
-  if check_ai_page_unlock "Character.AI" "character.ai" "https://character.ai/" "200 307" "blocked|geo|unavailable"; then
-    check_ai_api_unlock "Character.AI API" "neo.character.ai" "https://neo.character.ai/turns/" "400 401 405" "403" "可访问" "主页可达，API 受限" || true
-    return 0
-  fi
-  return 1
+  check_ai_page_unlock "Character.AI" "character.ai" "https://character.ai/" "200 307" "blocked|geo|unavailable"
 }
 
 check_poe_unlock() {
-  if check_ai_page_unlock "Poe" "poe.com" "https://poe.com/" "200 302 307" "blocked|geo|unavailable"; then
-    check_ai_api_unlock "Poe API" "poe.com" "https://poe.com/api/settings" "200 401 405" "403" "可访问" "API 受限" || true
-    return 0
-  fi
-  return 1
+  check_ai_page_unlock "Poe" "poe.com" "https://poe.com/" "200 302 307" "blocked|geo|unavailable"
 }
 
 check_sora_unlock() {
@@ -654,17 +600,12 @@ check_sora_unlock() {
 }
 
 check_kimi_unlock() {
-  if check_ai_page_unlock "Kimi" "kimi.moonshot.cn" "https://kimi.moonshot.cn/" "200 301 302" "blocked|geo|unavailable"; then
-    check_ai_api_unlock "Kimi API" "api.moonshot.cn" "https://api.moonshot.cn/v1/models" "200 401" "403" "可访问（API 需认证）" "API 地区受限" || true
-    return 0
-  fi
-  return 1
+  check_ai_page_unlock "Kimi" "kimi.moonshot.cn" "https://kimi.moonshot.cn/" "200 301 302" "blocked|geo|unavailable"
 }
 
 check_all_ai_http_egress() {
   local ok_count=0 total=0
-  total=$((total + 1)); check_chatgpt_web_unlock && ok_count=$((ok_count + 1))
-  total=$((total + 1)); check_openai_api_unlock && ok_count=$((ok_count + 1))
+  total=$((total + 1)); check_chatgpt_unlock && ok_count=$((ok_count + 1))
   total=$((total + 1)); check_ai_page_unlock "Google Gemini" "gemini.google.com" "https://gemini.google.com/" "200 301 302" "sorry|geo|blocked" && ok_count=$((ok_count + 1))
   total=$((total + 1)); check_ai_page_unlock "Claude" "claude.ai" "https://claude.ai/" "200 307" "blocked|geo|unavailable" && ok_count=$((ok_count + 1))
   total=$((total + 1)); check_copilot_unlock && ok_count=$((ok_count + 1))
@@ -676,7 +617,7 @@ check_all_ai_http_egress() {
   total=$((total + 1)); check_sora_unlock && ok_count=$((ok_count + 1))
   total=$((total + 1)); check_deepseek_unlock && ok_count=$((ok_count + 1))
   total=$((total + 1)); check_kimi_unlock && ok_count=$((ok_count + 1))
-  printf "  解锁: %s/%s\n" "$ok_count" "$total"
+  printf "  可访问: %s/%s\n" "$ok_count" "$total"
 }
 
 collect_ai_check_hosts() {
@@ -734,7 +675,7 @@ show_unlock_summary() {
   done < <(collect_ai_check_hosts)
   printf "  AI 域名命中: %s/%s\n" "$dns_ok_count" "$dns_total"
   echo "--------------------------------------"
-  printf "AI HTTPS 出口检测（绕过本机分流）：\n"
+  printf "AI 站点可用性检测（本机出口，IP.Check.Place 风格）：\n"
   check_all_ai_http_egress || true
   echo "--------------------------------------"
 }
