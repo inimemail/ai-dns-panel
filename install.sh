@@ -40,16 +40,6 @@ AI_CHECK_HOSTS=(
   "meta.ai"
   "you.com"
 )
-AI_CHECK_URLS=(
-  "https://chatgpt.com"
-  "https://claude.ai"
-  "https://gemini.google.com"
-  "https://copilot.microsoft.com"
-  "https://perplexity.ai"
-  "https://grok.com"
-  "https://deepseek.com"
-  "https://mistral.ai"
-)
 AI_SERVICE_CHECKS=(
   "ChatGPT|chatgpt.com"
   "Claude|claude.ai"
@@ -2604,7 +2594,7 @@ test_node_dns() {
     else dns_timeout_count=$((dns_timeout_count + 1)); printf "  %b %s -> 无 A 记录响应\n" "$(color 33 "[无响应]")" "$domain"; fi
   done < <(collect_ai_check_hosts)
   if [ "$dns_ok_count" -eq 0 ] && [ "$dns_timeout_count" -gt 0 ]; then
-    warn "AI 域名 A 记录无响应：DNS 分流未返回结果；下面会继续用 --resolve 强制走解锁机 443 测试。"
+    warn "AI 域名 A 记录无响应：DNS 分流未返回结果。"
     [ -n "$node_public_ip" ] && warn "当前节点公网 IP 是 $node_public_ip，请确认它已经在解锁机白名单中。"
   elif [ "$dns_miss_count" -gt 0 ]; then
     warn "AI 域名没有解析到解锁机：请在解锁机重新生成配置，并确认 dnsmasq 配置里有 local=/域名/ 和 address=/域名/$configured_dns。"
@@ -2623,21 +2613,19 @@ test_node_dns() {
     else
       printf "  %b getent chatgpt.com -> 失败\n" "$(color 31 "[失败]")"
     fi
+    if getent ahostsv4 raw.githubusercontent.com >/tmp/ai_unlock_getent_raw_github.log 2>/dev/null; then
+      printf "  %b getent raw.githubusercontent.com -> %s\n" "$(color 32 "[成功]")" "$(head -n 1 /tmp/ai_unlock_getent_raw_github.log)"
+    else
+      printf "  %b getent raw.githubusercontent.com -> 失败（普通域名转发异常）\n" "$(color 31 "[失败]")"
+      warn "普通域名解析失败：请在解锁机检查 dnsmasq 是否能访问上游 DNS ${PUBLIC_DNS_SERVERS[*]}。"
+    fi
   else
     printf "  %b 未安装 getent，跳过系统解析测试\n" "$(color 33 "[跳过]")"
   fi
 
   echo "--------------------------------------"
-  info "强制走解锁机测试:"
-  local url host code force_ok_count=0
-  for url in "${AI_CHECK_URLS[@]}"; do
-    host="$(printf '%s\n' "$url" | awk -F/ '{print $3}')"
-    code="$(curl -k -sS -L --connect-timeout 5 --max-time 10 --resolve "${host}:443:${configured_dns}" -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)"
-    if print_ai_http_result "解锁" "$url" "$code"; then
-      force_ok_count=$((force_ok_count + 1))
-    fi
-  done
-  printf "  通过项: %s/%s\n" "$force_ok_count" "${#AI_CHECK_URLS[@]}"
+  info "AI 解锁判定（与解锁机检测一致）:"
+  check_all_ai_unlock "$configured_dns" "$configured_dns" || true
 }
 
 unlock_menu() {
