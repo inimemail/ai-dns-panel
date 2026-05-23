@@ -460,164 +460,134 @@ EOF
   printf "  命中: %s/%s\n" "$ok_count" "$total"
 }
 
-http_code_is_reachable() {
+http_code_is_response() {
   local code="$1"
   case "$code" in
-    2*|3*|401|429) return 0 ;;
+    [1-5][0-9][0-9]) return 0 ;;
     *) return 1 ;;
   esac
 }
 
-curl_ai_direct_egress() {
-  local host="$1"
-  shift
-  curl -k -sS -L --connect-timeout 6 --max-time 18 -H "User-Agent: Mozilla/5.0" "$@"
+curl_ai_via_unlock() {
+  local unlock_ip="$1" host="$2"
+  shift 2
+  curl -k -sS --connect-timeout 6 --max-time 18 --resolve "${host}:443:${unlock_ip}" -H "User-Agent: Mozilla/5.0" "$@"
 }
 
-print_ai_unlock_status() {
+print_ai_path_status() {
   local name="$1" status="$2" info="$3"
   case "$status" in
-    ok) printf "  %b %s -> %s\n" "$(color 32 "[解锁]")" "$name" "$info"; return 0 ;;
+    ok) printf "  %b %s -> %s\n" "$(color 32 "[通过]")" "$name" "$info"; return 0 ;;
     no) printf "  %b %s -> %s\n" "$(color 31 "[受限]")" "$name" "$info"; return 1 ;;
-    *) printf "  %b %s -> %s\n" "$(color 33 "[异常]")" "$name" "$info"; return 1 ;;
+    *) printf "  %b %s -> %s\n" "$(color 31 "[失败]")" "$name" "$info"; return 1 ;;
   esac
 }
 
 check_chatgpt_unlock() {
-  local api_res ios_res favicon_code trace loc colo api_block="" ios_block=""
-  api_res="$(curl_ai_direct_egress "api.openai.com" "https://api.openai.com/compliance/cookie_requirements" 2>/dev/null || true)"
-  ios_res="$(curl_ai_direct_egress "ios.chat.openai.com" "https://ios.chat.openai.com/" 2>/dev/null || true)"
-  favicon_code="$(curl_ai_direct_egress "chatgpt.com" -o /dev/null -w '%{http_code}' "https://chatgpt.com/favicon.ico" 2>/dev/null || true)"
-  trace="$(curl_ai_direct_egress "chat.openai.com" "https://chat.openai.com/cdn-cgi/trace" 2>/dev/null || true)"
+  local unlock_ip="$1" api_res ios_res favicon_code trace loc colo api_block="" ios_block=""
+  api_res="$(curl_ai_via_unlock "$unlock_ip" "api.openai.com" "https://api.openai.com/compliance/cookie_requirements" 2>/dev/null || true)"
+  ios_res="$(curl_ai_via_unlock "$unlock_ip" "ios.chat.openai.com" "https://ios.chat.openai.com/" 2>/dev/null || true)"
+  favicon_code="$(curl_ai_via_unlock "$unlock_ip" "chatgpt.com" -o /dev/null -w '%{http_code}' "https://chatgpt.com/favicon.ico" 2>/dev/null || true)"
+  trace="$(curl_ai_via_unlock "$unlock_ip" "chat.openai.com" "https://chat.openai.com/cdn-cgi/trace" 2>/dev/null || true)"
   loc="$(printf '%s\n' "$trace" | awk -F= '/^loc=/ {print $2; exit}')"
   colo="$(printf '%s\n' "$trace" | awk -F= '/^colo=/ {print $2; exit}')"
 
   echo "$api_res" | grep -Eqi 'unsupported_country|country_not_supported' && api_block=1
   echo "$ios_res" | grep -Eqi 'VPN|unsupported_country|country_not_supported|not available' && ios_block=1
-  if [ -n "$api_block" ] && [ -n "$favicon_code" ] && [ "$favicon_code" != "000" ] && [ "$favicon_code" != "403" ]; then
+  if [ -n "$api_block" ] && http_code_is_response "$favicon_code" && [ "$favicon_code" != "403" ]; then
     api_block=""
   fi
 
-  if [ -z "$api_res" ] && [ -z "$ios_res" ] && { [ -z "$favicon_code" ] || [ "$favicon_code" = "000" ]; }; then
-    print_ai_unlock_status "ChatGPT" err "网络连接失败"
+  if [ -z "$api_res" ] && [ -z "$ios_res" ] && ! http_code_is_response "$favicon_code"; then
+    print_ai_path_status "ChatGPT" err "HTTPS 链路失败"
     return 1
   fi
   if [ -n "$api_block" ] && [ -n "$ios_block" ]; then
-    print_ai_unlock_status "ChatGPT" no "地区不支持"
-    return 1
+    print_ai_path_status "ChatGPT" no "HTTPS 链路正常，但 OpenAI 返回地区限制${loc:+（trace: $loc${colo:+/$colo}）}"
+    return 0
   fi
   if [ -n "$ios_block" ]; then
-    print_ai_unlock_status "ChatGPT" ok "仅网页可用${loc:+（出口: $loc${colo:+/$colo}）}"
+    print_ai_path_status "ChatGPT" ok "HTTPS 链路正常，仅网页可用${loc:+（trace: $loc${colo:+/$colo}）}"
     return 0
   fi
   if [ -n "$api_block" ]; then
-    print_ai_unlock_status "ChatGPT" ok "仅 App/API 受限${loc:+（出口: $loc${colo:+/$colo}）}"
+    print_ai_path_status "ChatGPT" ok "HTTPS 链路正常，仅 App/API 受限${loc:+（trace: $loc${colo:+/$colo}）}"
     return 0
   fi
-  print_ai_unlock_status "ChatGPT" ok "可访问${loc:+（出口: $loc${colo:+/$colo}）}"
+  print_ai_path_status "ChatGPT" ok "HTTPS 链路正常${loc:+（trace: $loc${colo:+/$colo}）}"
   return 0
 }
 
-check_ai_page_unlock() {
-  local name="$1" host="$2" url="$3" ok_codes="$4" block_regex="$5" res code final_url
-  res="$(curl_ai_direct_egress "$host" -o /dev/null -w '%{http_code}:%{url_effective}' "$url" 2>/dev/null || true)"
-  code="${res%%:*}"
-  final_url="${res#*:}"
-  if [ -z "$code" ] || [ "$code" = "000" ]; then
-    print_ai_unlock_status "$name" err "网络连接失败"
+check_ai_https_tunnel() {
+  local unlock_ip="$1" name="$2" host="$3" url="$4" code
+  code="$(curl_ai_via_unlock "$unlock_ip" "$host" -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)"
+  if ! http_code_is_response "$code"; then
+    print_ai_path_status "$name" err "HTTPS 链路失败"
     return 1
   fi
-  if echo "$final_url" | grep -Eqi "$block_regex" || [ "$code" = "403" ]; then
-    print_ai_unlock_status "$name" no "地区不支持"
-    return 1
-  fi
-  case " $ok_codes " in
-    *" $code "*)
-      print_ai_unlock_status "$name" ok "可访问"
-      return 0
-      ;;
-  esac
-  print_ai_unlock_status "$name" err "检测失败 HTTP $code"
-  return 1
+  print_ai_path_status "$name" ok "HTTPS 链路正常 HTTP $code"
+  return 0
 }
 
 check_copilot_unlock() {
-  local res code final_url api_code
-  res="$(curl_ai_direct_egress "copilot.microsoft.com" -o /dev/null -w '%{http_code}:%{url_effective}' "https://copilot.microsoft.com/" 2>/dev/null || true)"
-  code="${res%%:*}"
-  final_url="${res#*:}"
-  if [ -z "$code" ] || [ "$code" = "000" ]; then
-    print_ai_unlock_status "Microsoft Copilot" err "网络连接失败"
+  local unlock_ip="$1" code api_code
+  code="$(curl_ai_via_unlock "$unlock_ip" "copilot.microsoft.com" -o /dev/null -w '%{http_code}' "https://copilot.microsoft.com/" 2>/dev/null || true)"
+  if ! http_code_is_response "$code"; then
+    print_ai_path_status "Microsoft Copilot" err "HTTPS 链路失败"
     return 1
   fi
-  if echo "$final_url" | grep -Eqi 'cn\.bing|blocked|sorry' || [ "$code" = "403" ]; then
-    print_ai_unlock_status "Microsoft Copilot" no "地区不支持"
-    return 1
+  api_code="$(curl_ai_via_unlock "$unlock_ip" "copilot.microsoft.com" -o /dev/null -w '%{http_code}' "https://copilot.microsoft.com/c/api/user" 2>/dev/null || true)"
+  if http_code_is_response "$api_code"; then
+    print_ai_path_status "Microsoft Copilot" ok "HTTPS 链路正常 HTTP $code / API $api_code"
+    return 0
   fi
-  case "$code" in
-    200|301|302)
-      api_code="$(curl_ai_direct_egress "copilot.microsoft.com" -o /dev/null -w '%{http_code}' "https://copilot.microsoft.com/c/api/user" 2>/dev/null || true)"
-      if [ "$api_code" = "200" ] || [ "$api_code" = "401" ]; then
-        print_ai_unlock_status "Microsoft Copilot" ok "可访问"
-        return 0
-      fi
-      if [ "$api_code" = "403" ]; then
-        print_ai_unlock_status "Microsoft Copilot" no "API 拒绝访问"
-        return 1
-      fi
-      print_ai_unlock_status "Microsoft Copilot" err "主页可达，API HTTP $api_code"
-      return 1
-      ;;
-    *)
-      print_ai_unlock_status "Microsoft Copilot" err "检测失败 HTTP $code"
-      return 1
-      ;;
-  esac
+  print_ai_path_status "Microsoft Copilot" ok "HTTPS 链路正常 HTTP $code"
+  return 0
 }
 
 check_grok_unlock() {
-  check_ai_page_unlock "Grok" "grok.com" "https://grok.com/" "200 301 302" "blocked|geo|unavailable|sorry"
+  check_ai_https_tunnel "$1" "Grok" "grok.com" "https://grok.com/"
 }
 
 check_mistral_unlock() {
-  check_ai_page_unlock "Mistral" "chat.mistral.ai" "https://chat.mistral.ai/" "200 301 302" "blocked|geo|unavailable|sorry"
+  check_ai_https_tunnel "$1" "Mistral" "chat.mistral.ai" "https://chat.mistral.ai/"
 }
 
 check_deepseek_unlock() {
-  check_ai_page_unlock "DeepSeek" "chat.deepseek.com" "https://chat.deepseek.com/" "200 301 302" "blocked|geo|unavailable|sorry"
+  check_ai_https_tunnel "$1" "DeepSeek" "chat.deepseek.com" "https://chat.deepseek.com/"
 }
 
 check_character_unlock() {
-  check_ai_page_unlock "Character.AI" "character.ai" "https://character.ai/" "200 307" "blocked|geo|unavailable"
+  check_ai_https_tunnel "$1" "Character.AI" "character.ai" "https://character.ai/"
 }
 
 check_poe_unlock() {
-  check_ai_page_unlock "Poe" "poe.com" "https://poe.com/" "200 302 307" "blocked|geo|unavailable"
+  check_ai_https_tunnel "$1" "Poe" "poe.com" "https://poe.com/"
 }
 
 check_sora_unlock() {
-  check_ai_page_unlock "OpenAI Sora" "sora.com" "https://sora.com/" "200 301 307" "blocked|geo|not-supported|sorry"
+  check_ai_https_tunnel "$1" "OpenAI Sora" "sora.com" "https://sora.com/"
 }
 
 check_kimi_unlock() {
-  check_ai_page_unlock "Kimi" "kimi.moonshot.cn" "https://kimi.moonshot.cn/" "200 301 302" "blocked|geo|unavailable"
+  check_ai_https_tunnel "$1" "Kimi" "kimi.moonshot.cn" "https://kimi.moonshot.cn/"
 }
 
-check_all_ai_http_egress() {
-  local ok_count=0 total=0
-  total=$((total + 1)); check_chatgpt_unlock && ok_count=$((ok_count + 1))
-  total=$((total + 1)); check_ai_page_unlock "Google Gemini" "gemini.google.com" "https://gemini.google.com/" "200 301 302" "sorry|geo|blocked" && ok_count=$((ok_count + 1))
-  total=$((total + 1)); check_ai_page_unlock "Claude" "claude.ai" "https://claude.ai/" "200 307" "blocked|geo|unavailable" && ok_count=$((ok_count + 1))
-  total=$((total + 1)); check_copilot_unlock && ok_count=$((ok_count + 1))
-  total=$((total + 1)); check_ai_page_unlock "Perplexity" "www.perplexity.ai" "https://www.perplexity.ai/" "200 307" "blocked|geo|unavailable" && ok_count=$((ok_count + 1))
-  total=$((total + 1)); check_grok_unlock && ok_count=$((ok_count + 1))
-  total=$((total + 1)); check_mistral_unlock && ok_count=$((ok_count + 1))
-  total=$((total + 1)); check_character_unlock && ok_count=$((ok_count + 1))
-  total=$((total + 1)); check_poe_unlock && ok_count=$((ok_count + 1))
-  total=$((total + 1)); check_sora_unlock && ok_count=$((ok_count + 1))
-  total=$((total + 1)); check_deepseek_unlock && ok_count=$((ok_count + 1))
-  total=$((total + 1)); check_kimi_unlock && ok_count=$((ok_count + 1))
-  printf "  可访问: %s/%s\n" "$ok_count" "$total"
+check_all_ai_unlock_path() {
+  local unlock_ip="$1" ok_count=0 total=0
+  total=$((total + 1)); check_chatgpt_unlock "$unlock_ip" && ok_count=$((ok_count + 1))
+  total=$((total + 1)); check_ai_https_tunnel "$unlock_ip" "Google Gemini" "gemini.google.com" "https://gemini.google.com/" && ok_count=$((ok_count + 1))
+  total=$((total + 1)); check_ai_https_tunnel "$unlock_ip" "Claude" "claude.ai" "https://claude.ai/" && ok_count=$((ok_count + 1))
+  total=$((total + 1)); check_copilot_unlock "$unlock_ip" && ok_count=$((ok_count + 1))
+  total=$((total + 1)); check_ai_https_tunnel "$unlock_ip" "Perplexity" "www.perplexity.ai" "https://www.perplexity.ai/" && ok_count=$((ok_count + 1))
+  total=$((total + 1)); check_grok_unlock "$unlock_ip" && ok_count=$((ok_count + 1))
+  total=$((total + 1)); check_mistral_unlock "$unlock_ip" && ok_count=$((ok_count + 1))
+  total=$((total + 1)); check_character_unlock "$unlock_ip" && ok_count=$((ok_count + 1))
+  total=$((total + 1)); check_poe_unlock "$unlock_ip" && ok_count=$((ok_count + 1))
+  total=$((total + 1)); check_sora_unlock "$unlock_ip" && ok_count=$((ok_count + 1))
+  total=$((total + 1)); check_deepseek_unlock "$unlock_ip" && ok_count=$((ok_count + 1))
+  total=$((total + 1)); check_kimi_unlock "$unlock_ip" && ok_count=$((ok_count + 1))
+  printf "  HTTPS 链路通过: %s/%s\n" "$ok_count" "$total"
 }
 
 collect_ai_check_hosts() {
@@ -675,8 +645,8 @@ show_unlock_summary() {
   done < <(collect_ai_check_hosts)
   printf "  AI 域名命中: %s/%s\n" "$dns_ok_count" "$dns_total"
   echo "--------------------------------------"
-  printf "AI 站点可用性检测（本机出口，IP.Check.Place 风格）：\n"
-  check_all_ai_http_egress || true
+  printf "AI 解锁链路检测（经本机 SNIProxy）：\n"
+  check_all_ai_unlock_path "$server_ip" || true
   echo "--------------------------------------"
 }
 
@@ -2869,6 +2839,9 @@ test_node_dns() {
   echo "--------------------------------------"
   info "AI DNS 命中判定:"
   check_all_ai_dns_hits "$configured_dns" "$configured_dns" || true
+  echo "--------------------------------------"
+  info "AI 解锁链路检测（经解锁机 SNIProxy）:"
+  check_all_ai_unlock_path "$configured_dns" || true
 }
 
 unlock_menu() {
