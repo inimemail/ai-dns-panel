@@ -59,7 +59,7 @@ AI_SERVICE_CHECKS=(
 
 PUBLIC_DNS_SERVERS=("1.1.1.1" "8.8.8.8")
 
-OPENAI_DOMAINS=("openai.com" "api.openai.com" "auth.openai.com" "platform.openai.com" "chatgpt.com" "oaiusercontent.com" "oaistatic.com")
+OPENAI_DOMAINS=("openai.com" "api.openai.com" "auth.openai.com" "platform.openai.com" "chatgpt.com" "chat.openai.com" "sora.com" "oaiusercontent.com" "oaistatic.com")
 ANTHROPIC_DOMAINS=("anthropic.com" "api.anthropic.com" "claude.ai" "claude.com" "claudeusercontent.com")
 GOOGLE_DOMAINS=("google.com" "googleapis.com" "generativelanguage.googleapis.com" "gstatic.com" "googleusercontent.com" "ggpht.com" "ytimg.com" "withgoogle.com" "googletagmanager.com" "googlevideo.com" "gemini.google.com" "aistudio.google.com")
 PERPLEXITY_DOMAINS=("perplexity.ai" "perplexity.com" "api.perplexity.ai")
@@ -68,7 +68,7 @@ MICROSOFT_DOMAINS=("copilot.microsoft.com" "bing.com")
 MIDJOURNEY_DOMAINS=("midjourney.com" "alpha.midjourney.com")
 DEEPSEEK_DOMAINS=("deepseek.com" "chat.deepseek.com" "api.deepseek.com" "platform.deepseek.com")
 MISTRAL_DOMAINS=("mistral.ai" "chat.mistral.ai" "console.mistral.ai" "api.mistral.ai")
-OTHER_DOMAINS=("character.ai" "poe.com" "openrouter.ai" "platform.openrouter.ai" "meta.ai" "you.com")
+OTHER_DOMAINS=("character.ai" "neo.character.ai" "poe.com" "openrouter.ai" "platform.openrouter.ai" "meta.ai" "you.com" "kimi.moonshot.cn" "api.moonshot.cn")
 
 BASE_DOMAINS=("${OPENAI_DOMAINS[@]}" "${ANTHROPIC_DOMAINS[@]}" "${GOOGLE_DOMAINS[@]}" "${PERPLEXITY_DOMAINS[@]}" "${XAI_DOMAINS[@]}" "${MICROSOFT_DOMAINS[@]}" "${MIDJOURNEY_DOMAINS[@]}" "${DEEPSEEK_DOMAINS[@]}" "${MISTRAL_DOMAINS[@]}" "${OTHER_DOMAINS[@]}")
 
@@ -439,14 +439,14 @@ check_ai_service_endpoint() {
   local dns_server="$1" expected_ip="$2" name="$3" host="$4" resolved
   resolved="$(resolve_a_record "$dns_server" "$host")"
   if [ "$resolved" = "$expected_ip" ]; then
-    printf "  %b %s\n" "$(color 32 "[通过]")" "$name"
+    printf "  %b %s\n" "$(color 32 "[命中]")" "$name"
     return 0
   fi
-  printf "  %b %s\n" "$(color 31 "[失败]")" "$name"
+  printf "  %b %s\n" "$(color 31 "[未命中]")" "$name"
   return 1
 }
 
-check_all_ai_unlock() {
+check_all_ai_dns_hits() {
   local dns_server="$1" expected_ip="$2" item name host ok_count=0 total=0
   for item in "${AI_SERVICE_CHECKS[@]}"; do
     IFS='|' read -r name host <<EOF
@@ -457,33 +457,206 @@ EOF
       ok_count=$((ok_count + 1))
     fi
   done
-  printf "  通过: %s/%s\n" "$ok_count" "$total"
+  printf "  命中: %s/%s\n" "$ok_count" "$total"
 }
 
-http_code_is_unlocked() {
+http_code_is_reachable() {
   local code="$1"
   case "$code" in
-    2*) return 0 ;;
+    2*|3*|401|429) return 0 ;;
     *) return 1 ;;
   esac
 }
 
-print_ai_http_result() {
-  local prefix="$1" url="$2" code="$3"
+curl_ai_via_sniproxy() {
+  local host="$1"; shift
+  curl -k -sS -L --connect-timeout 6 --max-time 18 --resolve "${host}:443:127.0.0.1" -H "User-Agent: Mozilla/5.0" "$@"
+}
+
+print_ai_unlock_status() {
+  local name="$1" status="$2" info="$3"
+  case "$status" in
+    ok) printf "  %b %s -> %s\n" "$(color 32 "[解锁]")" "$name" "$info"; return 0 ;;
+    no) printf "  %b %s -> %s\n" "$(color 31 "[受限]")" "$name" "$info"; return 1 ;;
+    *) printf "  %b %s -> %s\n" "$(color 33 "[异常]")" "$name" "$info"; return 1 ;;
+  esac
+}
+
+check_chatgpt_unlock() {
+  local res code url trace loc colo api_res
+  res="$(curl_ai_via_sniproxy "chat.openai.com" -o /dev/null -w '%{http_code}:%{url_effective}' "https://chat.openai.com/" 2>/dev/null || true)"
+  code="${res%%:*}"
+  url="${res#*:}"
+  if echo "$url" | grep -Eqi 'sorry|blocked|unsupported_country' || [ "$code" = "403" ]; then
+    print_ai_unlock_status "ChatGPT Web" no "地区不支持"
+  elif [ "$code" = "200" ] || [ "$code" = "307" ]; then
+    trace="$(curl_ai_via_sniproxy "chat.openai.com" "https://chat.openai.com/cdn-cgi/trace" 2>/dev/null || true)"
+    loc="$(printf '%s\n' "$trace" | awk -F= '/^loc=/ {print $2; exit}')"
+    colo="$(printf '%s\n' "$trace" | awk -F= '/^colo=/ {print $2; exit}')"
+    print_ai_unlock_status "ChatGPT Web" ok "可访问${loc:+（出口: $loc${colo:+/$colo}）}"
+  elif [ -z "$code" ] || [ "$code" = "000" ]; then
+    print_ai_unlock_status "ChatGPT Web" err "网络连接失败"
+  else
+    print_ai_unlock_status "ChatGPT Web" err "检测失败 HTTP $code"
+  fi
+
+  api_res="$(curl_ai_via_sniproxy "api.openai.com" "https://api.openai.com/v1/models" 2>/dev/null || true)"
+  if echo "$api_res" | grep -Eqi 'unsupported_country|country_not_supported'; then
+    print_ai_unlock_status "OpenAI API" no "地区不支持"
+  elif echo "$api_res" | grep -Eqi '"data"[[:space:]]*:[[:space:]]*\['; then
+    print_ai_unlock_status "OpenAI API" ok "可访问"
+  elif echo "$api_res" | grep -qi 'invalid_api_key'; then
+    print_ai_unlock_status "OpenAI API" ok "可访问（需要 API Key）"
+  else
+    print_ai_unlock_status "OpenAI API" err "检测失败"
+  fi
+}
+
+check_ai_page_unlock() {
+  local name="$1" host="$2" url="$3" ok_codes="$4" block_regex="$5" res code final_url
+  res="$(curl_ai_via_sniproxy "$host" -o /dev/null -w '%{http_code}:%{url_effective}' "$url" 2>/dev/null || true)"
+  code="${res%%:*}"
+  final_url="${res#*:}"
   if [ -z "$code" ] || [ "$code" = "000" ]; then
-    printf "  %b %s\n" "$(color 31 "[$prefix失败]")" "$url"
+    print_ai_unlock_status "$name" err "网络连接失败"
     return 1
   fi
-  if http_code_is_unlocked "$code"; then
-    printf "  %b %s\n" "$(color 32 "[$prefix通过]")" "$url"
-    return 0
+  if echo "$final_url" | grep -Eqi "$block_regex" || [ "$code" = "403" ]; then
+    print_ai_unlock_status "$name" no "地区不支持"
+    return 1
+  fi
+  case " $ok_codes " in
+    *" $code "*)
+      print_ai_unlock_status "$name" ok "可访问"
+      return 0
+      ;;
+  esac
+  print_ai_unlock_status "$name" err "检测失败 HTTP $code"
+  return 1
+}
+
+check_ai_api_unlock() {
+  local name="$1" host="$2" api_url="$3" ok_codes="$4" no_code="$5" ok_text="$6" no_text="$7" code
+  code="$(curl_ai_via_sniproxy "$host" -o /dev/null -w '%{http_code}' "$api_url" 2>/dev/null || true)"
+  if [ -z "$code" ] || [ "$code" = "000" ]; then
+    print_ai_unlock_status "$name" err "网络连接失败"
+    return 1
+  fi
+  if [ "$code" = "$no_code" ]; then
+    print_ai_unlock_status "$name" no "$no_text"
+    return 1
+  fi
+  case " $ok_codes " in
+    *" $code "*)
+      print_ai_unlock_status "$name" ok "$ok_text"
+      return 0
+      ;;
+  esac
+  print_ai_unlock_status "$name" err "检测失败 HTTP $code"
+  return 1
+}
+
+check_copilot_unlock() {
+  local res code final_url api_code
+  res="$(curl_ai_via_sniproxy "copilot.microsoft.com" -o /dev/null -w '%{http_code}:%{url_effective}' "https://copilot.microsoft.com/" 2>/dev/null || true)"
+  code="${res%%:*}"
+  final_url="${res#*:}"
+  if [ -z "$code" ] || [ "$code" = "000" ]; then
+    print_ai_unlock_status "Microsoft Copilot" err "网络连接失败"
+    return 1
+  fi
+  if echo "$final_url" | grep -Eqi 'cn\.bing|blocked|sorry' || [ "$code" = "403" ]; then
+    print_ai_unlock_status "Microsoft Copilot" no "地区不支持"
+    return 1
   fi
   case "$code" in
-    401) printf "  %b %s\n" "$(color 33 "[$prefix需认证]")" "$url" ;;
-    3*) printf "  %b %s\n" "$(color 33 "[$prefix跳转]")" "$url" ;;
-    *) printf "  %b %s\n" "$(color 31 "[$prefix失败]")" "$url" ;;
+    200|301|302)
+      api_code="$(curl_ai_via_sniproxy "copilot.microsoft.com" -o /dev/null -w '%{http_code}' "https://copilot.microsoft.com/c/api/user" 2>/dev/null || true)"
+      if [ "$api_code" = "200" ] || [ "$api_code" = "401" ]; then
+        print_ai_unlock_status "Microsoft Copilot" ok "可访问"
+        return 0
+      fi
+      if [ "$api_code" = "403" ]; then
+        print_ai_unlock_status "Microsoft Copilot" no "API 拒绝访问"
+        return 1
+      fi
+      print_ai_unlock_status "Microsoft Copilot" err "主页可达，API HTTP $api_code"
+      return 1
+      ;;
+    *)
+      print_ai_unlock_status "Microsoft Copilot" err "检测失败 HTTP $code"
+      return 1
+      ;;
   esac
+}
+
+check_grok_unlock() {
+  if check_ai_page_unlock "Grok" "grok.com" "https://grok.com/" "200 301 302" "blocked|geo|unavailable|sorry"; then
+    check_ai_api_unlock "Grok API" "api.x.ai" "https://api.x.ai/v1/models" "200 401" "403" "可访问（API 需认证）" "API 地区受限" || true
+    return 0
+  fi
   return 1
+}
+
+check_mistral_unlock() {
+  if check_ai_page_unlock "Mistral" "chat.mistral.ai" "https://chat.mistral.ai/" "200 301 302" "blocked|geo|unavailable|sorry"; then
+    check_ai_api_unlock "Mistral API" "api.mistral.ai" "https://api.mistral.ai/v1/models" "200 401" "403" "可访问（API 需认证）" "API 地区受限" || true
+    return 0
+  fi
+  return 1
+}
+
+check_deepseek_unlock() {
+  if check_ai_page_unlock "DeepSeek" "chat.deepseek.com" "https://chat.deepseek.com/" "200 301 302" "blocked|geo|unavailable|sorry"; then
+    check_ai_api_unlock "DeepSeek API" "api.deepseek.com" "https://api.deepseek.com/v1/models" "200 401" "403" "可访问（API 需认证）" "API 地区受限" || true
+    return 0
+  fi
+  return 1
+}
+
+check_character_unlock() {
+  if check_ai_page_unlock "Character.AI" "character.ai" "https://character.ai/" "200 307" "blocked|geo|unavailable"; then
+    check_ai_api_unlock "Character.AI API" "neo.character.ai" "https://neo.character.ai/turns/" "400 401 405" "403" "可访问" "主页可达，API 受限" || true
+    return 0
+  fi
+  return 1
+}
+
+check_poe_unlock() {
+  if check_ai_page_unlock "Poe" "poe.com" "https://poe.com/" "200 302 307" "blocked|geo|unavailable"; then
+    check_ai_api_unlock "Poe API" "poe.com" "https://poe.com/api/settings" "200 401 405" "403" "可访问" "API 受限" || true
+    return 0
+  fi
+  return 1
+}
+
+check_sora_unlock() {
+  check_ai_page_unlock "OpenAI Sora" "sora.com" "https://sora.com/" "200 301 307" "blocked|geo|not-supported|sorry"
+}
+
+check_kimi_unlock() {
+  if check_ai_page_unlock "Kimi" "kimi.moonshot.cn" "https://kimi.moonshot.cn/" "200 301 302" "blocked|geo|unavailable"; then
+    check_ai_api_unlock "Kimi API" "api.moonshot.cn" "https://api.moonshot.cn/v1/models" "200 401" "403" "可访问（API 需认证）" "API 地区受限" || true
+    return 0
+  fi
+  return 1
+}
+
+check_all_ai_http_egress() {
+  local ok_count=0 total=0
+  total=$((total + 1)); check_chatgpt_unlock && ok_count=$((ok_count + 1))
+  total=$((total + 1)); check_ai_page_unlock "Google Gemini" "gemini.google.com" "https://gemini.google.com/" "200 301 302" "sorry|geo|blocked" && ok_count=$((ok_count + 1))
+  total=$((total + 1)); check_ai_page_unlock "Claude" "claude.ai" "https://claude.ai/" "200 307" "blocked|geo|unavailable" && ok_count=$((ok_count + 1))
+  total=$((total + 1)); check_copilot_unlock && ok_count=$((ok_count + 1))
+  total=$((total + 1)); check_ai_page_unlock "Perplexity" "www.perplexity.ai" "https://www.perplexity.ai/" "200 307" "blocked|geo|unavailable" && ok_count=$((ok_count + 1))
+  total=$((total + 1)); check_grok_unlock && ok_count=$((ok_count + 1))
+  total=$((total + 1)); check_mistral_unlock && ok_count=$((ok_count + 1))
+  total=$((total + 1)); check_character_unlock && ok_count=$((ok_count + 1))
+  total=$((total + 1)); check_poe_unlock && ok_count=$((ok_count + 1))
+  total=$((total + 1)); check_sora_unlock && ok_count=$((ok_count + 1))
+  total=$((total + 1)); check_deepseek_unlock && ok_count=$((ok_count + 1))
+  total=$((total + 1)); check_kimi_unlock && ok_count=$((ok_count + 1))
+  printf "  解锁: %s/%s\n" "$ok_count" "$total"
 }
 
 collect_ai_check_hosts() {
@@ -541,8 +714,8 @@ show_unlock_summary() {
   done < <(collect_ai_check_hosts)
   printf "  AI 域名命中: %s/%s\n" "$dns_ok_count" "$dns_total"
   echo "--------------------------------------"
-  printf "AI 解锁判定：\n"
-  check_all_ai_unlock "127.0.0.1" "$server_ip" || true
+  printf "AI HTTPS 出口检测（经本机 sniproxy）：\n"
+  check_all_ai_http_egress || true
   echo "--------------------------------------"
 }
 
@@ -1267,7 +1440,11 @@ if [ -z "$NODE_IP" ]; then
   echo "未能获取节点公网 IP，未修改 DNS"
   exit 1
 fi
-curl -fsS --max-time 8 "$PANEL_URL/node-join?token=$TOKEN&ip=$NODE_IP&name=$NODE_NAME" >/dev/null
+if ! curl -fsS --max-time 8 "$PANEL_URL/node-join?token=$TOKEN&ip=$NODE_IP&name=$NODE_NAME" >/dev/null; then
+  echo "节点加入解锁机白名单失败，未修改 DNS"
+  echo "请检查面板地址是否能访问: $PANEL_URL"
+  exit 1
+fi
 if command -v systemctl >/dev/null 2>&1; then
   systemctl stop systemd-resolved 2>/dev/null || true
   systemctl disable systemd-resolved 2>/dev/null || true
@@ -1280,6 +1457,7 @@ rm -f /etc/resolv.conf
 printf 'nameserver %s\n' "$UNLOCK_IP" > /etc/resolv.conf
 chattr +i /etc/resolv.conf 2>/dev/null || true
 echo "节点机 DNS 已指向 $UNLOCK_IP"
+echo "节点公网 IP: $NODE_IP（已提交到解锁机白名单）"
 if [ -L /etc/resolv.conf ]; then
   echo "警告: /etc/resolv.conf 仍然是 symlink -> $(readlink /etc/resolv.conf 2>/dev/null || true)"
 else
@@ -1399,7 +1577,7 @@ fn dashboard_html(state: &AppState, session: &Session, host: &str, q: &HashMap<S
     <form method="post" action="/action/stop"><input type="hidden" name="csrf" value="{csrf}"><button class="danger">暂停服务</button></form>
   </div>
 </section>
-<section class="glass"><div class="head"><div><h2>AI 解锁判定</h2></div></div><div class="checks">{service_checks}</div></section>"#,
+<section class="glass"><div class="head"><div><h2>AI DNS 命中判定</h2></div></div><div class="checks">{service_checks}</div></section>"#,
         flash = flash(q),
         ip = html(&ip),
         dns = service_status("dnsmasq"),
@@ -2711,8 +2889,8 @@ test_node_dns() {
   fi
 
   echo "--------------------------------------"
-  info "AI 解锁判定（与解锁机检测一致）:"
-  check_all_ai_unlock "$configured_dns" "$configured_dns" || true
+  info "AI DNS 命中判定:"
+  check_all_ai_dns_hits "$configured_dns" "$configured_dns" || true
 }
 
 unlock_menu() {
