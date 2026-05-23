@@ -475,15 +475,15 @@ check_ai_api_endpoint() {
   done
   case "$code" in
     ""|000)
-      printf "  %b %-10s %s\n" "$(color 31 "[失败]")" "$name" "$host"
+      printf "  %b %s\n" "$(color 31 "[失败]")" "$name"
       return 1
       ;;
     403|451)
-      printf "  %b %-10s %s HTTP %s\n" "$(color 31 "[受限]")" "$name" "$host" "$code"
+      printf "  %b %s\n" "$(color 31 "[受限]")" "$name"
       return 1
       ;;
     *)
-      printf "  %b %-10s %s HTTP %s\n" "$(color 32 "[可达]")" "$name" "$host" "$code"
+      printf "  %b %s\n" "$(color 32 "[可达]")" "$name"
       return 0
       ;;
   esac
@@ -558,7 +558,7 @@ show_unlock_summary() {
   done < <(collect_ai_check_hosts)
   printf "  AI 域名命中: %s/%s\n" "$dns_ok_count" "$dns_total"
   echo "--------------------------------------"
-  printf "AI API 连通检测：\n"
+  printf "AI 解锁判定：\n"
   check_all_ai_api_unlock "127.0.0.1" || true
   echo "--------------------------------------"
 }
@@ -631,6 +631,18 @@ random_string() {
   if command_exists tr; then tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c "${1:-24}"; else date +%s%N; fi
 }
 
+random_password() {
+  local len="${1:-22}" chars='A-Za-z0-9@#%+=_:,.-' specials='@#%+=_:,.-' body special
+  [ "$len" -lt 2 ] 2>/dev/null && len=2
+  if command_exists tr; then
+    body="$(tr -dc "$chars" </dev/urandom 2>/dev/null | head -c "$((len - 1))")"
+    special="$(tr -dc "$specials" </dev/urandom 2>/dev/null | head -c 1)"
+    printf '%s%s' "$body" "$special"
+  else
+    printf 'AiUnlock@%s#%s' "$(date +%s)" "$RANDOM"
+  fi
+}
+
 panel_port() {
   if [ -s "$PANEL_PORT_FILE" ]; then tr -cd '0-9' < "$PANEL_PORT_FILE"; else printf '%s' "$PANEL_DEFAULT_PORT"; fi
 }
@@ -662,7 +674,7 @@ change_panel_port() {
 
 reset_panel_password() {
   local pass
-  pass="$(random_string 18)"
+  pass="$(random_password 22)"
   set_panel_password "admin" "$pass" || return 1
   service_restart ai-unlock-panel
   ok "Web 面板密码已重置。"
@@ -911,10 +923,13 @@ async fn main() -> io::Result<()> {
         .route("/domains/add", post(domains_add))
         .route("/domains/delete", post(domains_delete))
         .route("/domains/clear", post(domains_clear))
+        .route("/settings/update", post(settings_update))
         .route("/action/update", post(action_update))
         .route("/action/sync", post(action_sync))
         .route("/action/stop", post(action_stop))
         .route("/node.sh", get(node_script))
+        .route("/node-uninstall.sh", get(node_uninstall_script))
+        .route("/node-join", get(node_join))
         .layer(CookieManagerLayer::new())
         .with_state(state);
 
@@ -1005,12 +1020,17 @@ async fn dashboard(State(state): State<Arc<AppState>>, cookies: Cookies, headers
     Html(layout("仪表盘", &session, &dashboard_html(&state, &session, &host, &q))).into_response()
 }
 
-async fn nodes_page(State(state): State<Arc<AppState>>, cookies: Cookies, Query(q): Query<HashMap<String, String>>) -> Response {
+async fn nodes_page(State(state): State<Arc<AppState>>, cookies: Cookies, headers: HeaderMap, Query(q): Query<HashMap<String, String>>) -> Response {
     let Some((_sid, session)) = auth_session(&state, &cookies) else {
         return Redirect::to("/login").into_response();
     };
     let nodes = load_nodes().unwrap_or_default();
-    Html(layout("节点管理", &session, &nodes_html(&session, &nodes, &q))).into_response()
+    let host = headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{}:{}", detect_public_ip(), state.port));
+    Html(layout("节点管理", &session, &nodes_html(&session, &nodes, &q, &host, state.join_token.as_str()))).into_response()
 }
 
 async fn domains_page(State(state): State<Arc<AppState>>, cookies: Cookies, Query(q): Query<HashMap<String, String>>) -> Response {
@@ -1177,6 +1197,34 @@ async fn domains_clear(State(state): State<Arc<AppState>>, cookies: Cookies, For
     Redirect::to("/domains?ok=cleared").into_response()
 }
 
+async fn settings_update(State(state): State<Arc<AppState>>, cookies: Cookies, Form(form): Form<HashMap<String, String>>) -> Response {
+    let Some((_sid, session)) = auth_session(&state, &cookies) else {
+        return Redirect::to("/login").into_response();
+    };
+    if !csrf_ok(&session, &form) {
+        return Redirect::to("/?err=csrf").into_response();
+    }
+    let current_user = current_username();
+    let current_pass = val(&form, "current_password");
+    if !verify_password(&current_user, &current_pass) {
+        return Redirect::to("/?err=bad_password").into_response();
+    }
+    let username = val(&form, "username");
+    let password = val(&form, "password");
+    let confirm = val(&form, "confirm");
+    if username.is_empty() || username.contains(':') || username.len() > 40 {
+        return Redirect::to("/?err=bad_user").into_response();
+    }
+    if password.len() < 10 || !password.chars().any(|c| !c.is_ascii_alphanumeric()) {
+        return Redirect::to("/?err=weak_password").into_response();
+    }
+    if password != confirm {
+        return Redirect::to("/?err=pass_mismatch").into_response();
+    }
+    let _ = fs::write(AUTH_FILE, make_auth_line(&username, &password));
+    Redirect::to("/?ok=settings").into_response()
+}
+
 async fn action_update(State(state): State<Arc<AppState>>, cookies: Cookies, Form(form): Form<HashMap<String, String>>) -> Response {
     action_guard(&state, &cookies, &form, || update_rules())
 }
@@ -1207,16 +1255,20 @@ where
     Redirect::to("/?ok=done").into_response()
 }
 
-async fn node_script(State(state): State<Arc<AppState>>, Query(q): Query<HashMap<String, String>>) -> Response {
-    if q.get("token").map(String::as_str) != Some(state.join_token.as_str()) {
+async fn node_script(State(state): State<Arc<AppState>>, headers: HeaderMap, Query(q): Query<HashMap<String, String>>) -> Response {
+    let token = q.get("token").map(String::as_str).unwrap_or("");
+    if !join_token_ok(&state, token) {
         return (StatusCode::FORBIDDEN, "forbidden").into_response();
     }
     let ip = detect_public_ip();
+    let panel = panel_base_url(&headers, state.port);
     let body = format!(
         r#"#!/bin/bash
 set -e
 [ "$EUID" -ne 0 ] && echo "请使用 root 权限运行" && exit 1
 UNLOCK_IP="{ip}"
+PANEL_URL="{panel}"
+TOKEN="{token}"
 if command -v systemctl >/dev/null 2>&1 && systemctl is-active systemd-resolved >/dev/null 2>&1; then
   systemctl stop systemd-resolved 2>/dev/null || true
   systemctl disable systemd-resolved 2>/dev/null || true
@@ -1225,30 +1277,75 @@ chattr -i /etc/resolv.conf 2>/dev/null || true
 rm -f /etc/resolv.conf
 printf 'nameserver %s\n' "$UNLOCK_IP" > /etc/resolv.conf
 chattr +i /etc/resolv.conf 2>/dev/null || true
+NODE_IP="$(curl -k -fs4 --max-time 5 https://1.1.1.1/cdn-cgi/trace 2>/dev/null | awk -F= '/^ip=/ {{print $2; exit}}' || true)"
+[ -n "$NODE_IP" ] || NODE_IP="$(curl -fs4 --max-time 5 https://ifconfig.me 2>/dev/null || true)"
+NODE_NAME="$(hostname 2>/dev/null | tr -cd 'A-Za-z0-9_.-' || echo node)"
+[ -n "$NODE_NAME" ] || NODE_NAME="node"
+if [ -n "$NODE_IP" ]; then
+  curl -fsS --max-time 8 "$PANEL_URL/node-join?token=$TOKEN&ip=$NODE_IP&name=$NODE_NAME" >/dev/null 2>&1 || true
+fi
 echo "节点机 DNS 已指向 $UNLOCK_IP"
 "#
     );
     ([(axum::http::header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")], body).into_response()
 }
 
+async fn node_uninstall_script(State(state): State<Arc<AppState>>, Query(q): Query<HashMap<String, String>>) -> Response {
+    let token = q.get("token").map(String::as_str).unwrap_or("");
+    if !join_token_ok(&state, token) {
+        return (StatusCode::FORBIDDEN, "forbidden").into_response();
+    }
+    let body = r#"#!/bin/bash
+set -e
+[ "$EUID" -ne 0 ] && echo "请使用 root 权限运行" && exit 1
+chattr -i /etc/resolv.conf 2>/dev/null || true
+rm -f /etc/resolv.conf
+printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf
+echo "节点机 DNS 已恢复为 1.1.1.1 / 8.8.8.8"
+"#;
+    ([(axum::http::header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")], body).into_response()
+}
+
+async fn node_join(State(state): State<Arc<AppState>>, Query(q): Query<HashMap<String, String>>) -> Response {
+    let token = q.get("token").map(String::as_str).unwrap_or("");
+    if !join_token_ok(&state, token) {
+        return (StatusCode::FORBIDDEN, "forbidden").into_response();
+    }
+    let ip = q.get("ip").map(String::as_str).unwrap_or("").trim();
+    if !valid_ip(ip) {
+        return (StatusCode::BAD_REQUEST, "bad ip").into_response();
+    }
+    let name = q.get("name").map(|v| v.trim().to_string()).unwrap_or_default();
+    let mut nodes = load_nodes().unwrap_or_default();
+    if let Some(node) = nodes.iter_mut().find(|n| n.ip == ip) {
+        if !name.is_empty() {
+            node.name = name;
+        }
+    } else {
+        nodes.push(Node {
+            id: Uuid::new_v4().to_string(),
+            ip: ip.to_string(),
+            name,
+            note: "auto".to_string(),
+            created: now_label(),
+        });
+    }
+    let _ = save_nodes(&nodes, true);
+    "ok".into_response()
+}
+
 fn dashboard_html(state: &AppState, session: &Session, host: &str, q: &HashMap<String, String>) -> String {
     let ip = detect_public_ip();
     let nodes = load_nodes().unwrap_or_default();
-    let quick = format!(
-        "curl -fsSL http://{}/node.sh?token={} | bash",
-        host,
-        urlencoding::encode(&state.join_token)
-    );
     let api_checks = API_CHECKS
         .iter()
         .map(|check| {
             let ok = check_ai_api(check, "127.0.0.1");
             format!(
-                r#"<div class="check"><span class="{}">{}</span><strong>{}: {}</strong></div>"#,
+                r#"<div class="check"><span class="{}">{}</span><strong>{}</strong></div>"#,
                 if ok { "ok" } else { "bad" },
                 if ok { "可达" } else { "失败" },
-                html(check.name),
-                html(check.host)
+                html(check.name)
             )
         })
         .collect::<String>();
@@ -1268,8 +1365,7 @@ fn dashboard_html(state: &AppState, session: &Session, host: &str, q: &HashMap<S
     <form method="post" action="/action/stop"><input type="hidden" name="csrf" value="{csrf}"><button class="danger">暂停服务</button></form>
   </div>
 </section>
-<section class="glass"><div class="head"><div><h2>节点机快速使用命令</h2><p>在节点机 root 终端执行。</p></div></div><pre class="cmd">{quick}</pre></section>
-<section class="glass"><div class="head"><div><h2>AI API 连通检测</h2></div></div><div class="checks">{api_checks}</div></section>"#,
+<section class="glass"><div class="head"><div><h2>AI 解锁判定</h2></div></div><div class="checks">{api_checks}</div></section>"#,
         flash = flash(q),
         ip = html(&ip),
         dns = service_status("dnsmasq"),
@@ -1278,12 +1374,13 @@ fn dashboard_html(state: &AppState, session: &Session, host: &str, q: &HashMap<S
         sni_cls = if service_status("sniproxy") == "active" { "ok" } else { "bad" },
         count = nodes.len(),
         csrf = html(&session.csrf),
-        quick = html(&quick),
         api_checks = api_checks
     )
 }
 
-fn nodes_html(session: &Session, nodes: &[Node], q: &HashMap<String, String>) -> String {
+fn nodes_html(session: &Session, nodes: &[Node], q: &HashMap<String, String>, host: &str, join_token: &str) -> String {
+    let install_cmd = format!("curl -fsSL http://{}/node.sh?token=__TOKEN__ | bash", host);
+    let uninstall_cmd = format!("curl -fsSL http://{}/node-uninstall.sh?token=__TOKEN__ | bash", host);
     let rows = nodes
         .iter()
         .map(|n| {
@@ -1305,6 +1402,10 @@ fn nodes_html(session: &Session, nodes: &[Node], q: &HashMap<String, String>) ->
         .collect::<String>();
     format!(
         r#"{flash}
+<section class="glass"><div class="head"><div><h2>节点对接</h2></div></div><div class="actions">
+  <button class="copy-command" data-token="{token}" data-template="{install_cmd}">复制对接命令</button>
+  <button class="copy-command ghost danger" data-token="{token}" data-template="{uninstall_cmd}">复制卸载命令</button>
+</div></section>
 <section class="grid split">
   <div class="glass"><div class="head"><div><h2>添加节点</h2><p>添加后自动同步白名单。</p></div></div><form class="stack" method="post" action="/nodes/add"><input type="hidden" name="csrf" value="{csrf}"><label>节点公网 IP<input name="ip" required placeholder="1.2.3.4"></label><label>名称<input name="name"></label><label>备注<input name="note"></label><button>添加节点</button></form></div>
   <div class="glass"><div class="head"><div><h2>批量添加</h2><p>每行一个 IP，可跟名称。</p></div></div><form class="stack" method="post" action="/nodes/batch-add"><input type="hidden" name="csrf" value="{csrf}"><textarea name="items" rows="7" placeholder="1.2.3.4 节点A&#10;5.6.7.8 节点B"></textarea><button>批量添加</button></form></div>
@@ -1313,6 +1414,9 @@ fn nodes_html(session: &Session, nodes: &[Node], q: &HashMap<String, String>) ->
 <section class="glass"><div class="head"><div><h2>批量删除</h2><p>输入要删除的 IP。</p></div></div><form class="stack" method="post" action="/nodes/batch-delete"><input type="hidden" name="csrf" value="{csrf}"><textarea name="items" rows="5"></textarea><button class="danger">批量删除</button></form></section>"#,
         flash = flash(q),
         csrf = html(&session.csrf),
+        token = html(join_token),
+        install_cmd = html(&install_cmd),
+        uninstall_cmd = html(&uninstall_cmd),
         count = nodes.len(),
         rows = rows
     )
@@ -1358,12 +1462,82 @@ fn layout(title: &str, session: &Session, body: &str) -> String {
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} - AI Unlock</title><style>{css}</style></head>
 <body>
 <div class="bg"></div>
-<header class="nav"><div class="brand">AI Unlock</div><nav><a href="/">仪表盘</a><a href="/nodes">节点管理</a><a href="/domains">域名池</a></nav><form method="post" action="/logout"><input type="hidden" name="csrf" value="{csrf}"><button class="ghost">退出</button></form></header>
+<header class="nav"><div class="brand">AI Unlock</div><nav><a href="/">仪表盘</a><a href="/nodes">节点管理</a><a href="/domains">域名池</a></nav><button type="button" class="ghost settings-toggle">设置</button></header>
+<div class="modal-backdrop" id="settings-modal" hidden>
+  <section class="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+    <div class="head"><div><h2 id="settings-title">设置</h2></div><button type="button" class="ghost" data-close-settings>关闭</button></div>
+    <form class="stack" method="post" action="/settings/update"><input type="hidden" name="csrf" value="{csrf}">
+      <label>新用户名<input name="username" value="{username}" required autocomplete="username"></label>
+      <label>当前密码<input name="current_password" type="password" required autocomplete="current-password"></label>
+      <label>新密码<input name="password" type="password" required autocomplete="new-password"></label>
+      <label>确认新密码<input name="confirm" type="password" required autocomplete="new-password"></label>
+      <button>保存账号</button>
+    </form>
+    <form method="post" action="/logout"><input type="hidden" name="csrf" value="{csrf}"><button class="ghost danger">退出登录</button></form>
+  </section>
+</div>
 <main class="wrap"><div class="page-title"><h1>{title}</h1></div>{body}</main>
+<script>
+const settingsModal = document.getElementById('settings-modal');
+const openSettings = () => {{
+  if (settingsModal) settingsModal.hidden = false;
+}};
+const closeSettings = () => {{
+  if (settingsModal) settingsModal.hidden = true;
+}};
+document.querySelectorAll('.settings-toggle').forEach((button) => button.addEventListener('click', openSettings));
+document.querySelectorAll('[data-close-settings]').forEach((button) => button.addEventListener('click', closeSettings));
+if (settingsModal) {{
+  settingsModal.addEventListener('click', (event) => {{
+    if (event.target === settingsModal) closeSettings();
+  }});
+  document.addEventListener('keydown', (event) => {{
+    if (event.key === 'Escape') closeSettings();
+  }});
+  const settingsErrors = ['csrf', 'bad_password', 'bad_user', 'weak_password', 'pass_mismatch'];
+  const params = new URLSearchParams(window.location.search);
+  if (settingsErrors.includes(params.get('err'))) openSettings();
+}}
+document.querySelectorAll('.copy-command').forEach((button) => {{
+  button.addEventListener('click', async () => {{
+    const token = button.dataset.token || '';
+    const suffix = (window.crypto && window.crypto.getRandomValues)
+      ? Array.from(window.crypto.getRandomValues(new Uint8Array(9))).map((n) => n.toString(36)).join('').slice(0, 12)
+      : String(Date.now());
+    const command = (button.dataset.template || '').replace('__TOKEN__', `${{token}}.${{suffix}}`);
+    let copied = false;
+    try {{
+      if (navigator.clipboard && window.isSecureContext) {{
+        await navigator.clipboard.writeText(command);
+        copied = true;
+      }}
+    }} catch (_) {{}}
+    if (!copied) {{
+      const area = document.createElement('textarea');
+      area.value = command;
+      area.style.position = 'fixed';
+      area.style.left = '-9999px';
+      document.body.appendChild(area);
+      area.focus();
+      area.select();
+      try {{ copied = document.execCommand('copy'); }} catch (_) {{}}
+      area.remove();
+    }}
+    if (copied) {{
+      const old = button.textContent;
+      button.textContent = '已复制';
+      setTimeout(() => button.textContent = old, 1200);
+    }} else {{
+      prompt('复制命令', command);
+    }}
+  }});
+}});
+</script>
 </body></html>"#,
         title = html(title),
         css = CSS,
         csrf = html(&session.csrf),
+        username = html(&current_username()),
         body = body
     )
 }
@@ -1399,6 +1573,31 @@ fn csrf_ok(session: &Session, form: &HashMap<String, String>) -> bool {
     form.get("csrf").map(String::as_str) == Some(session.csrf.as_str())
 }
 
+fn current_username() -> String {
+    fs::read_to_string(AUTH_FILE)
+        .ok()
+        .and_then(|raw| raw.split(':').next().map(str::to_string))
+        .filter(|user| !user.is_empty())
+        .unwrap_or_else(|| "admin".to_string())
+}
+
+fn join_token_ok(state: &AppState, token: &str) -> bool {
+    token == state.join_token.as_str()
+        || token
+            .strip_prefix(state.join_token.as_str())
+            .map(|rest| rest.starts_with('.'))
+            .unwrap_or(false)
+}
+
+fn panel_base_url(headers: &HeaderMap, port: u16) -> String {
+    let host = headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{}:{}", detect_public_ip(), port));
+    format!("http://{host}")
+}
+
 fn flash(q: &HashMap<String, String>) -> String {
     if let Some(ok) = q.get("ok") {
         let msg = match ok.as_str() {
@@ -1406,6 +1605,7 @@ fn flash(q: &HashMap<String, String>) -> String {
             "deleted" => "已删除",
             "cleared" => "已清空",
             "done" => "操作完成",
+            "settings" => "账号已更新",
             _ => "操作完成",
         };
         return format!(r#"<div class="alert ok">{msg}</div>"#);
@@ -1416,6 +1616,10 @@ fn flash(q: &HashMap<String, String>) -> String {
             "bad_ip" => "IP 格式错误",
             "exists" => "IP 已存在",
             "bad_domain" => "域名格式错误",
+            "bad_password" => "当前密码错误",
+            "bad_user" => "用户名无效",
+            "weak_password" => "新密码至少 10 位且包含特殊符号",
+            "pass_mismatch" => "两次密码不一致",
             _ => "操作失败",
         };
         return format!(r#"<div class="alert bad">{msg}</div>"#);
@@ -1855,7 +2059,7 @@ fn shell_word(input: &str) -> String {
 
 const CSS: &str = r#"
 :root{--primary:#3b82f6;--danger:#ef4444;--success:#10b981;--warn:#d97706;--ink:#374151;--muted:#6b7280}
-*{box-sizing:border-box}body{margin:0;min-height:100vh;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--ink);background:#e9eef6;letter-spacing:0}.bg{position:fixed;inset:0;z-index:-1;background:linear-gradient(135deg,#d8e6f7 0%,#eef2f7 45%,#d7efe7 100%)}.nav{position:sticky;top:0;z-index:10;background:rgba(255,255,255,.34);backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);border-bottom:1px solid rgba(255,255,255,.45);padding:14px 28px;display:flex;align-items:center;justify-content:space-between;gap:16px}.brand{font-weight:800;font-size:18px}.nav nav{display:flex;gap:8px}.nav a{color:var(--ink);text-decoration:none;border-radius:12px;padding:9px 12px}.nav a:hover{background:rgba(255,255,255,.42)}.wrap{width:min(1180px,94vw);margin:24px auto 40px;display:grid;gap:18px}.page-title h1{margin:0;font-size:28px}.grid{display:grid;gap:16px}.metrics{grid-template-columns:repeat(4,minmax(0,1fr))}.split{grid-template-columns:repeat(2,minmax(0,1fr))}.glass,.metric,.login-box{background:rgba(255,255,255,.38);backdrop-filter:blur(22px);-webkit-backdrop-filter:blur(22px);border:1px solid rgba(255,255,255,.58);border-radius:18px;box-shadow:0 8px 30px rgba(31,41,55,.06);padding:20px}.metric span{display:block;color:var(--muted);font-size:13px}.metric strong{display:block;margin-top:6px;font-size:24px;overflow-wrap:anywhere}.head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:15px}.head h2{margin:0;font-size:18px}.head p{margin:3px 0 0;color:var(--muted)}button{border:0;border-radius:12px;background:rgba(59,130,246,.9);color:white;padding:10px 15px;font-weight:700;cursor:pointer;white-space:nowrap}button:hover{filter:brightness(.96);transform:translateY(-1px)}button.danger,.danger{background:rgba(239,68,68,.9);color:white}button.ghost,.ghost{background:rgba(255,255,255,.55);color:var(--ink)}.actions{display:flex;gap:10px;flex-wrap:wrap}input,textarea{width:100%;border:1px solid rgba(255,255,255,.55);background:rgba(255,255,255,.55);border-radius:12px;padding:11px 12px;color:var(--ink);outline:none}input:focus,textarea:focus{background:rgba(255,255,255,.82);border-color:#93c5fd}textarea{resize:vertical}.stack{display:grid;gap:12px}label{display:grid;gap:6px;color:var(--muted)}.row{display:grid;grid-template-columns:1fr auto;gap:10px}.inline{display:grid;grid-template-columns:135px 1fr 1fr auto;gap:8px}.table{overflow:auto}table{width:100%;border-collapse:separate;border-spacing:0 10px}th{color:var(--muted);text-align:left;font-size:13px;padding:0 10px}td{background:rgba(255,255,255,.42);padding:10px;border-top:1px solid rgba(255,255,255,.44);border-bottom:1px solid rgba(255,255,255,.44)}td:first-child{border-left:1px solid rgba(255,255,255,.44);border-radius:14px 0 0 14px}td:last-child{border-right:1px solid rgba(255,255,255,.44);border-radius:0 14px 14px 0}code,.cmd{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.cmd{margin:0;background:rgba(15,23,42,.88);color:#eef6ff;border-radius:14px;padding:15px;white-space:pre-wrap;overflow:auto}.checks{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.check{display:flex;justify-content:space-between;gap:12px;background:rgba(255,255,255,.42);border:1px solid rgba(255,255,255,.48);border-radius:14px;padding:10px 12px}.ok{color:var(--success)}.bad{color:var(--danger)}.warn{color:var(--warn)}.muted{color:var(--muted)}.alert{border-radius:14px;padding:11px 13px;background:rgba(255,255,255,.5);border:1px solid rgba(255,255,255,.6)}.alert.ok{color:#047857}.alert.bad{color:#b91c1c}.pills{display:flex;flex-wrap:wrap;gap:8px}.pill{background:rgba(255,255,255,.45);border:1px solid rgba(255,255,255,.55);border-radius:999px;padding:7px 11px}.domain{display:flex;align-items:center;justify-content:space-between;background:rgba(255,255,255,.42);border:1px solid rgba(255,255,255,.5);border-radius:14px;padding:10px 12px;margin-bottom:8px}.login{min-height:100vh;display:grid;place-items:center;padding:24px}.login-box{width:min(390px,92vw);display:grid;gap:16px;text-align:left}.login-box h1{margin:0;font-size:28px}.login-box p{margin:0;color:var(--muted)}@media(max-width:780px){.nav{padding:12px 16px;flex-wrap:wrap}.wrap{margin:18px auto}.metrics,.split,.checks{grid-template-columns:1fr}.inline{grid-template-columns:1fr}th{display:none}tr,td{display:block}td{border:0!important;border-radius:0!important}td:first-child{border-radius:14px 14px 0 0!important}td:last-child{border-radius:0 0 14px 14px!important}}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--ink);background:#e9eef6;letter-spacing:0}.bg{position:fixed;inset:0;z-index:-1;background:linear-gradient(135deg,#d8e6f7 0%,#eef2f7 45%,#d7efe7 100%)}.nav{position:sticky;top:0;z-index:10;background:rgba(255,255,255,.82);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);border-bottom:1px solid rgba(209,213,219,.75);padding:12px 28px;display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:16px}.brand{font-weight:800;font-size:18px}.nav nav{display:flex;gap:8px;justify-content:center;flex-wrap:wrap}.nav a{color:var(--ink);text-decoration:none;border-radius:10px;padding:8px 11px}.nav a:hover{background:rgba(255,255,255,.72)}.wrap{width:min(1180px,94vw);margin:24px auto 40px;display:grid;gap:18px}.page-title h1{margin:0;font-size:28px}.grid{display:grid;gap:16px}.metrics{grid-template-columns:repeat(4,minmax(0,1fr))}.split{grid-template-columns:repeat(2,minmax(0,1fr))}.glass,.metric,.login-box{background:rgba(255,255,255,.46);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,.62);border-radius:14px;box-shadow:0 8px 30px rgba(31,41,55,.06);padding:20px}.metric span{display:block;color:var(--muted);font-size:13px}.metric strong{display:block;margin-top:6px;font-size:24px;overflow-wrap:anywhere}.head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:15px}.head h2{margin:0;font-size:18px}.head p{margin:3px 0 0;color:var(--muted)}button{border:0;border-radius:10px;background:rgba(59,130,246,.9);color:white;padding:10px 15px;font-weight:700;cursor:pointer;white-space:nowrap}button:hover{filter:brightness(.96);transform:translateY(-1px)}button.danger,.danger{background:rgba(239,68,68,.9);color:white}button.ghost,.ghost{background:rgba(255,255,255,.65);color:var(--ink)}.actions{display:flex;gap:10px;flex-wrap:wrap}input,textarea{width:100%;border:1px solid rgba(255,255,255,.55);background:rgba(255,255,255,.62);border-radius:10px;padding:11px 12px;color:var(--ink);outline:none}input:focus,textarea:focus{background:rgba(255,255,255,.86);border-color:#93c5fd}textarea{resize:vertical}.stack{display:grid;gap:12px}label{display:grid;gap:6px;color:var(--muted)}.row{display:grid;grid-template-columns:1fr auto;gap:10px}.inline{display:grid;grid-template-columns:135px 1fr 1fr auto;gap:8px}.table{overflow:auto}table{width:100%;border-collapse:separate;border-spacing:0 10px}th{color:var(--muted);text-align:left;font-size:13px;padding:0 10px}td{background:rgba(255,255,255,.42);padding:10px;border-top:1px solid rgba(255,255,255,.44);border-bottom:1px solid rgba(255,255,255,.44)}td:first-child{border-left:1px solid rgba(255,255,255,.44);border-radius:12px 0 0 12px}td:last-child{border-right:1px solid rgba(255,255,255,.44);border-radius:0 12px 12px 0}code,.cmd{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.cmd{margin:0;background:rgba(15,23,42,.88);color:#eef6ff;border-radius:12px;padding:15px;white-space:pre-wrap;overflow:auto}.checks{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.check{display:flex;align-items:center;justify-content:space-between;gap:12px;background:rgba(255,255,255,.46);border:1px solid rgba(255,255,255,.52);border-radius:12px;padding:10px 12px}.check strong{overflow-wrap:anywhere;text-align:right}.ok{color:var(--success)}.bad{color:var(--danger)}.warn{color:var(--warn)}.muted{color:var(--muted)}.alert{border-radius:12px;padding:11px 13px;background:rgba(255,255,255,.58);border:1px solid rgba(255,255,255,.65)}.alert.ok{color:#047857}.alert.bad{color:#b91c1c}.pills{display:flex;flex-wrap:wrap;gap:8px}.pill{background:rgba(255,255,255,.45);border:1px solid rgba(255,255,255,.55);border-radius:999px;padding:7px 11px}.domain{display:flex;align-items:center;justify-content:space-between;background:rgba(255,255,255,.42);border:1px solid rgba(255,255,255,.5);border-radius:12px;padding:10px 12px;margin-bottom:8px}.modal-backdrop{position:fixed;inset:0;z-index:50;display:grid;place-items:center;padding:20px;background:rgba(15,23,42,.32);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}.modal-backdrop[hidden]{display:none}.settings-modal{width:min(440px,92vw);display:grid;gap:14px;background:rgba(255,255,255,.9);border:1px solid rgba(255,255,255,.75);border-radius:14px;box-shadow:0 20px 60px rgba(15,23,42,.18);padding:20px}.settings-modal form{margin:0}.login{min-height:100vh;display:grid;place-items:center;padding:24px}.login-box{width:min(390px,92vw);display:grid;gap:16px;text-align:left}.login-box h1{margin:0;font-size:28px}.login-box p{margin:0;color:var(--muted)}@media(max-width:780px){.nav{position:sticky;grid-template-columns:1fr auto;grid-template-areas:"brand settings" "links links";gap:8px;padding:10px 14px}.brand{grid-area:brand}.settings-toggle{grid-area:settings}.nav nav{grid-area:links;justify-content:flex-start;gap:6px;overflow-x:auto;flex-wrap:nowrap;padding-bottom:2px}.nav a{padding:7px 9px;white-space:nowrap}.nav button{padding:7px 10px}.modal-backdrop{align-items:flex-start;padding-top:70px}.settings-modal{max-height:calc(100vh - 96px);overflow:auto}.wrap{margin:16px auto;width:94vw}.page-title h1{font-size:22px}.metrics,.split,.checks{grid-template-columns:1fr}.inline{grid-template-columns:1fr}.actions button{flex:1;min-width:138px}.head p{display:none}.check{min-height:48px}.check span{min-width:42px}th{display:none}tr,td{display:block}td{border:0!important;border-radius:0!important}td:first-child{border-radius:12px 12px 0 0!important}td:last-child{border-radius:0 0 12px 12px!important}}
 "#;
 AI_UNLOCK_PANEL_MAIN_EOF
   printf '%s
@@ -1954,7 +2158,7 @@ install_panel_service() {
   install -m 755 "$PANEL_WORK_DIR/target/release/ai-unlock-panel" "$PANEL_BIN" || return 1
 
   if [ ! -s "$PANEL_AUTH_FILE" ]; then
-    pass="$(random_string 18)"
+    pass="$(random_password 22)"
     set_panel_password "admin" "$pass" || return 1
   else
     reset_pass="${AI_UNLOCK_PANEL_RESET_PASSWORD:-}"
@@ -1962,7 +2166,7 @@ install_panel_service() {
       read -r -p "是否重置 Web 面板 admin 密码？(y/N): " reset_pass
     fi
     if [ "$reset_pass" = "y" ] || [ "$reset_pass" = "Y" ]; then
-      pass="$(random_string 18)"
+      pass="$(random_password 22)"
       set_panel_password "admin" "$pass" || return 1
     fi
   fi
@@ -2341,7 +2545,7 @@ test_node_dns() {
   fi
 
   echo "--------------------------------------"
-  info "AI API 连通检测:"
+  info "AI 解锁判定:"
   check_all_ai_api_unlock "$configured_dns" || true
 }
 
