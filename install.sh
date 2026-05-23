@@ -24,21 +24,21 @@ PANEL_DEFAULT_PORT="8088"
 PANEL_BIN="/usr/local/bin/ai-unlock-panel"
 PANEL_WORK_DIR="/opt/ai_unlock_panel"
 
-AI_CHECK_URLS=(
-  "https://chatgpt.com"
-  "https://claude.ai"
-  "https://gemini.google.com"
-  "https://copilot.microsoft.com"
-  "https://perplexity.ai"
-  "https://grok.com"
-  "https://midjourney.com"
-  "https://deepseek.com"
-  "https://mistral.ai"
-  "https://openrouter.ai"
-  "https://character.ai"
-  "https://poe.com"
-  "https://meta.ai"
-  "https://you.com"
+AI_CHECK_HOSTS=(
+  "chatgpt.com"
+  "claude.ai"
+  "gemini.google.com"
+  "copilot.microsoft.com"
+  "perplexity.ai"
+  "grok.com"
+  "midjourney.com"
+  "deepseek.com"
+  "mistral.ai"
+  "openrouter.ai"
+  "character.ai"
+  "poe.com"
+  "meta.ai"
+  "you.com"
 )
 AI_API_CHECKS=(
   "OpenAI|api.openai.com|https://api.openai.com/v1/models|Authorization: Bearer invalid_token_test|Content-Type: application/json"
@@ -455,18 +455,12 @@ check_unlock_dns_forward() {
   return 0
 }
 
-check_unlock_sni_endpoint() {
-  local server_ip="$1" url="$2" host code
-  host="$(printf '%s\n' "$url" | awk -F/ '{print $3}')"
-  code="$(curl -k -sS -L --connect-timeout 5 --max-time 12 --resolve "${host}:443:${server_ip}" -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)"
-  print_ai_http_result "SNI" "$url" "$code"
-}
-
 check_ai_api_endpoint() {
   local server_ip="$1" name="$2" host="$3" url="$4" header1="$5" header2="$6"
   local code body detail safe_name
   safe_name="$(printf '%s' "$name" | tr -cd 'A-Za-z0-9_-' | tr 'A-Z' 'a-z')"
   body="/tmp/ai_unlock_${safe_name}_api_check.log"
+  : > "$body" 2>/dev/null || true
   if [ -n "$header2" ]; then
     code="$(curl -k -sS --connect-timeout 5 --max-time 12 \
       --resolve "${host}:443:${server_ip}" \
@@ -478,7 +472,11 @@ check_ai_api_endpoint() {
       -H "$header1" \
       -o "$body" -w '%{http_code}' "$url" 2>/dev/null || true)"
   fi
-  detail="$(tr '\n' ' ' < "$body" 2>/dev/null | sed 's/[[:space:]][[:space:]]*/ /g' | cut -c1-180)"
+  if [ -f "$body" ]; then
+    detail="$(tr '\n' ' ' < "$body" 2>/dev/null | sed 's/[[:space:]][[:space:]]*/ /g' | cut -c1-180)"
+  else
+    detail=""
+  fi
   case "$code" in
     400|401)
       printf "  %b %s -> %s 无效请求/凭据（API 可达）\n" "$(color 32 "[$name通过]")" "$host" "$code"
@@ -524,7 +522,7 @@ EOF
 }
 
 collect_ai_check_hosts() {
-  local item name host url header1 header2 seen_hosts="" web_host
+  local item name host url header1 header2 seen_hosts="" check_host
   for item in "${AI_API_CHECKS[@]}"; do
     IFS='|' read -r name host url header1 header2 <<EOF
 $item
@@ -534,12 +532,11 @@ EOF
     seen_hosts="$seen_hosts $host"
     printf '%s\n' "$host"
   done
-  for url in "${AI_CHECK_URLS[@]}"; do
-    web_host="$(printf '%s\n' "$url" | awk -F/ '{print $3}')"
-    [ -z "$web_host" ] && continue
-    case " $seen_hosts " in *" $web_host "*) continue ;; esac
-    seen_hosts="$seen_hosts $web_host"
-    printf '%s\n' "$web_host"
+  for check_host in "${AI_CHECK_HOSTS[@]}"; do
+    [ -z "$check_host" ] && continue
+    case " $seen_hosts " in *" $check_host "*) continue ;; esac
+    seen_hosts="$seen_hosts $check_host"
+    printf '%s\n' "$check_host"
   done
 }
 
@@ -582,14 +579,6 @@ show_unlock_summary() {
   echo "--------------------------------------"
   printf "AI API 解锁判定（无效凭据返回 400/401 表示 API 可达，403 为受限）：\n"
   check_all_ai_api_unlock "$server_ip" || true
-  echo "--------------------------------------"
-  printf "网页 SNI 连通参考（首页可能被 WAF/跳转影响，不作为唯一判定）：\n"
-  local url sni_ok_count=0 sni_total=0
-  for url in "${AI_CHECK_URLS[@]}"; do
-    sni_total=$((sni_total + 1))
-    if check_unlock_sni_endpoint "$server_ip" "$url"; then sni_ok_count=$((sni_ok_count + 1)); fi
-  done
-  printf "  网页参考通过项: %s/%s\n" "$sni_ok_count" "$sni_total"
   echo "--------------------------------------"
   info "这个检测看的是解锁链路；节点机仍需加入白名单，并在云安全组放行 UDP/TCP 53 与 TCP 443。"
 }
@@ -822,22 +811,6 @@ const API_CHECKS: &[ApiCheck] = &[
     ApiCheck { name: "DeepSeek", host: "api.deepseek.com", url: "https://api.deepseek.com/v1/models", header1: "Authorization: Bearer invalid_token_test", header2: "Content-Type: application/json" },
     ApiCheck { name: "Mistral", host: "api.mistral.ai", url: "https://api.mistral.ai/v1/models", header1: "Authorization: Bearer invalid_token_test", header2: "Content-Type: application/json" },
     ApiCheck { name: "OpenRouter", host: "openrouter.ai", url: "https://openrouter.ai/api/v1/models", header1: "Authorization: Bearer invalid_token_test", header2: "Content-Type: application/json" },
-];
-const WEB_CHECK_URLS: &[&str] = &[
-    "https://chatgpt.com",
-    "https://claude.ai",
-    "https://gemini.google.com",
-    "https://copilot.microsoft.com",
-    "https://perplexity.ai",
-    "https://grok.com",
-    "https://midjourney.com",
-    "https://deepseek.com",
-    "https://mistral.ai",
-    "https://openrouter.ai",
-    "https://character.ai",
-    "https://poe.com",
-    "https://meta.ai",
-    "https://you.com",
 ];
 const BASE_DOMAINS: &[&str] = &[
     "openai.com",
@@ -1299,20 +1272,6 @@ fn dashboard_html(state: &AppState, session: &Session, host: &str, q: &HashMap<S
             )
         })
         .collect::<String>();
-    let web_checks = WEB_CHECK_URLS
-        .iter()
-        .map(|url| {
-            let host = host_from_url(url);
-            let ok = check_sni_url(url, &ip);
-            format!(
-                r#"<div class="check"><span class="{}">{}</span><strong>{}: {}</strong></div>"#,
-                if ok { "ok" } else { "bad" },
-                if ok { "通过" } else { "失败" },
-                html(host),
-                html(url)
-            )
-        })
-        .collect::<String>();
     format!(
         r#"{flash}
 <section class="grid metrics">
@@ -1330,8 +1289,7 @@ fn dashboard_html(state: &AppState, session: &Session, host: &str, q: &HashMap<S
   </div>
 </section>
 <section class="glass"><div class="head"><div><h2>节点机快速使用命令</h2><p>在节点机 root 终端执行。</p></div></div><pre class="cmd">{quick}</pre></section>
-<section class="glass"><div class="head"><div><h2>AI API 解锁判定</h2><p>强制 API 连接到本机 443，无效凭据返回 400/401 计为可达，403 为受限。</p></div></div><div class="checks">{api_checks}</div></section>
-<section class="glass"><div class="head"><div><h2>AI 网页 SNI 连通参考</h2><p>覆盖没有模型 API 检测入口的网页服务，首页跳转或 WAF 仅作参考。</p></div></div><div class="checks">{web_checks}</div></section>"#,
+<section class="glass"><div class="head"><div><h2>AI API 解锁判定</h2><p>强制 API 连接到本机 443，无效凭据返回 400/401 计为可达，403 为受限。</p></div></div><div class="checks">{api_checks}</div></section>"#,
         flash = flash(q),
         ip = html(&ip),
         dns = service_status("dnsmasq"),
@@ -1341,8 +1299,7 @@ fn dashboard_html(state: &AppState, session: &Session, host: &str, q: &HashMap<S
         count = nodes.len(),
         csrf = html(&session.csrf),
         quick = html(&quick),
-        api_checks = api_checks,
-        web_checks = web_checks
+        api_checks = api_checks
     )
 }
 
@@ -1780,38 +1737,6 @@ fn check_ai_api(check: &ApiCheck, server_ip: &str) -> bool {
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
     code == "400" || code == "401" || code == "429" || code.starts_with('2')
-}
-
-fn host_from_url(url: &str) -> &str {
-    url.split('/').nth(2).unwrap_or("")
-}
-
-fn check_sni_url(url: &str, server_ip: &str) -> bool {
-    let host = host_from_url(url);
-    if host.is_empty() || server_ip.is_empty() {
-        return false;
-    }
-    let resolve = format!("{host}:443:{server_ip}");
-    let code = output(
-        "curl",
-        &[
-            "-k",
-            "-sS",
-            "-L",
-            "--connect-timeout",
-            "5",
-            "--max-time",
-            "12",
-            "--resolve",
-            &resolve,
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{http_code}",
-            url,
-        ],
-    );
-    code.starts_with('2')
 }
 
 fn service_status(name: &str) -> String {
@@ -2436,14 +2361,8 @@ test_node_dns() {
   fi
 
   echo "--------------------------------------"
-  info "强制走解锁机测试:"
-  
-  for url in "${AI_CHECK_URLS[@]}"; do
-    local host code
-    host="$(echo "$url" | awk -F/ '{print $3}')"
-    code="$(curl -k -sS -L --connect-timeout 5 --max-time 10 --resolve "${host}:443:${configured_dns}" -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)"
-    print_ai_http_result "解锁" "$url" "$code"
-  done
+  info "AI API 强制走解锁机判定:"
+  check_all_ai_api_unlock "$configured_dns" || true
 }
 
 unlock_menu() {
