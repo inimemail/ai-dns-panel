@@ -40,6 +40,16 @@ AI_CHECK_HOSTS=(
   "meta.ai"
   "you.com"
 )
+AI_CHECK_URLS=(
+  "https://chatgpt.com"
+  "https://claude.ai"
+  "https://gemini.google.com"
+  "https://copilot.microsoft.com"
+  "https://perplexity.ai"
+  "https://grok.com"
+  "https://deepseek.com"
+  "https://mistral.ai"
+)
 AI_SERVICE_CHECKS=(
   "ChatGPT|chatgpt.com"
   "Claude|claude.ai"
@@ -458,6 +468,32 @@ EOF
     fi
   done
   printf "  通过: %s/%s\n" "$ok_count" "$total"
+}
+
+http_code_is_unlocked() {
+  local code="$1"
+  case "$code" in
+    2*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+print_ai_http_result() {
+  local prefix="$1" url="$2" code="$3"
+  if [ -z "$code" ] || [ "$code" = "000" ]; then
+    printf "  %b %s\n" "$(color 31 "[$prefix失败]")" "$url"
+    return 1
+  fi
+  if http_code_is_unlocked "$code"; then
+    printf "  %b %s\n" "$(color 32 "[$prefix通过]")" "$url"
+    return 0
+  fi
+  case "$code" in
+    401) printf "  %b %s\n" "$(color 33 "[$prefix需认证]")" "$url" ;;
+    3*) printf "  %b %s\n" "$(color 33 "[$prefix跳转]")" "$url" ;;
+    *) printf "  %b %s\n" "$(color 31 "[$prefix失败]")" "$url" ;;
+  esac
+  return 1
 }
 
 collect_ai_check_hosts() {
@@ -2152,7 +2188,7 @@ install_rust_build_deps() {
 }
 
 set_panel_password() {
-  local user="${1:-admin}" pass="$2" tmp_auth
+  local user="${1:-admin}" pass="$2" tmp_auth auth_user salt digest extra
   [ -z "$pass" ] && return 1
   [ -x "$PANEL_BIN" ] || return 1
   tmp_auth="$(mktemp "${PANEL_AUTH_FILE}.tmp.XXXXXX")" || return 1
@@ -2160,7 +2196,8 @@ set_panel_password() {
     rm -f "$tmp_auth"
     return 1
   fi
-  if ! awk -F: 'NF == 3 && $1 != "" && $2 ~ /^[0-9a-f]{32}$/ && $3 ~ /^[0-9a-f]{64}$/ {ok=1} END {exit ok?0:1}' "$tmp_auth"; then
+  IFS=: read -r auth_user salt digest extra < "$tmp_auth"
+  if [ "$auth_user" != "$user" ] || [ -n "$extra" ] || [ "${#salt}" -ne 32 ] || [ "${#digest}" -ne 64 ] || [[ "$salt$digest" == *[!0-9a-f]* ]]; then
     rm -f "$tmp_auth"
     err "生成面板密码哈希失败。"
     return 1
@@ -2567,7 +2604,7 @@ test_node_dns() {
     else dns_timeout_count=$((dns_timeout_count + 1)); printf "  %b %s -> 无 A 记录响应\n" "$(color 33 "[无响应]")" "$domain"; fi
   done < <(collect_ai_check_hosts)
   if [ "$dns_ok_count" -eq 0 ] && [ "$dns_timeout_count" -gt 0 ]; then
-    warn "AI 域名 A 记录无响应：请确认解锁机白名单里是【节点机公网 IP】，并重新同步防火墙规则。"
+    warn "AI 域名 A 记录无响应：DNS 分流未返回结果；下面会继续用 --resolve 强制走解锁机 443 测试。"
     [ -n "$node_public_ip" ] && warn "当前节点公网 IP 是 $node_public_ip，请确认它已经在解锁机白名单中。"
   elif [ "$dns_miss_count" -gt 0 ]; then
     warn "AI 域名没有解析到解锁机：请在解锁机重新生成配置，并确认 dnsmasq 配置里有 local=/域名/ 和 address=/域名/$configured_dns。"
@@ -2591,8 +2628,16 @@ test_node_dns() {
   fi
 
   echo "--------------------------------------"
-  info "AI 解锁判定:"
-  check_all_ai_unlock "$configured_dns" "$configured_dns" || true
+  info "强制走解锁机测试:"
+  local url host code force_ok_count=0
+  for url in "${AI_CHECK_URLS[@]}"; do
+    host="$(printf '%s\n' "$url" | awk -F/ '{print $3}')"
+    code="$(curl -k -sS -L --connect-timeout 5 --max-time 10 --resolve "${host}:443:${configured_dns}" -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)"
+    if print_ai_http_result "解锁" "$url" "$code"; then
+      force_ok_count=$((force_ok_count + 1))
+    fi
+  done
+  printf "  通过项: %s/%s\n" "$force_ok_count" "${#AI_CHECK_URLS[@]}"
 }
 
 unlock_menu() {
