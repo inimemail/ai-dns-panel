@@ -6,6 +6,7 @@ BASE_DIR="/etc/ai_unlock"
 CUSTOM_DOMAIN_FILE="$BASE_DIR/custom_domains.conf"
 NODE_WHITELIST_FILE="$BASE_DIR/node_whitelist.conf"
 DNSMASQ_CONF="/etc/dnsmasq.d/ai_unlock.conf"
+NODE_DNSMASQ_CONF="/etc/dnsmasq.d/ai_unlock_node.conf"
 SNI_CONF="/etc/sniproxy.conf"
 SNI_CONF_DIR="/etc/sniproxy/sniproxy.conf"
 SNI_DEFAULT="/etc/default/sniproxy"
@@ -308,6 +309,7 @@ if command -v nft >/dev/null 2>&1 && nft list table inet ai_unlock >/dev/null 2>
   else
     nft add chain inet ai_unlock input '{ type filter hook input priority 0; policy accept; }' 2>/dev/null || true
   fi
+  nft list set inet ai_unlock node_whitelist >/dev/null 2>&1 || nft add set inet ai_unlock node_whitelist '{ type ipv4_addr; flags interval; }' 2>/dev/null || true
   nft flush set inet ai_unlock node_whitelist 2>/dev/null || true
   nft add rule inet ai_unlock input iifname "lo" accept 2>/dev/null || true
   [ -f "$NODE_WHITELIST_FILE" ] || exit 0
@@ -468,6 +470,24 @@ http_code_is_response() {
   esac
 }
 
+# 链路通且服务正常响应（2xx/3xx/401）
+http_code_is_ok() {
+  local code="$1"
+  case "$code" in
+    2[0-9][0-9]|3[0-9][0-9]|401) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# 链路通但服务拒绝（403/429 等）— 只能证明 sniproxy 可达，不能证明 AI 服务已解锁
+http_code_is_blocked() {
+  local code="$1"
+  case "$code" in
+    403|429|451) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 curl_ai_via_unlock() {
   local unlock_ip="$1" host="$2"
   shift 2
@@ -476,10 +496,14 @@ curl_ai_via_unlock() {
 
 print_ai_path_status() {
   local name="$1" status="$2" info="$3"
+  AI_PATH_LAST_STATUS="$status"
   case "$status" in
-    ok) printf "  %b %s -> %s\n" "$(color 32 "[通过]")" "$name" "$info"; return 0 ;;
-    no) printf "  %b %s -> %s\n" "$(color 31 "[受限]")" "$name" "$info"; return 1 ;;
-    *) printf "  %b %s -> %s\n" "$(color 31 "[失败]")" "$name" "$info"; return 1 ;;
+    ok)        printf "  %b %s -> %s\n" "$(color 32 "[解锁]")" "$name" "$info"; return 0 ;;
+    partial)   printf "  %b %s -> %s\n" "$(color 33 "[部分]")" "$name" "$info"; return 0 ;;
+    reachable) printf "  %b %s -> %s\n" "$(color 36 "[可达]")" "$name" "$info"; return 0 ;;
+    blocked)   printf "  %b %s -> %s\n" "$(color 33 "[拒绝]")" "$name" "$info"; return 0 ;;
+    no)        printf "  %b %s -> %s\n" "$(color 31 "[受限]")" "$name" "$info"; return 0 ;;
+    *)         printf "  %b %s -> %s\n" "$(color 31 "[失败]")" "$name" "$info"; return 1 ;;
   esac
 }
 
@@ -507,11 +531,11 @@ check_chatgpt_unlock() {
     return 0
   fi
   if [ -n "$ios_block" ]; then
-    print_ai_path_status "ChatGPT" ok "HTTPS 链路正常，仅网页可用${loc:+（trace: $loc${colo:+/$colo}）}"
+    print_ai_path_status "ChatGPT" partial "HTTPS 链路正常，但 App/API 仍可能受限${loc:+（trace: $loc${colo:+/$colo}）}"
     return 0
   fi
   if [ -n "$api_block" ]; then
-    print_ai_path_status "ChatGPT" ok "HTTPS 链路正常，仅 App/API 受限${loc:+（trace: $loc${colo:+/$colo}）}"
+    print_ai_path_status "ChatGPT" partial "HTTPS 链路正常，但 API 仍受限${loc:+（trace: $loc${colo:+/$colo}）}"
     return 0
   fi
   print_ai_path_status "ChatGPT" ok "HTTPS 链路正常${loc:+（trace: $loc${colo:+/$colo}）}"
@@ -537,28 +561,39 @@ check_tls_handshake() {
 }
 
 check_ai_https_tunnel() {
-  local unlock_ip="$1" name="$2" host="$3" url="$4" code verbose_out tls_ok=""
-  # 同时获取 HTTP 状态码和 verbose 输出
+  local unlock_ip="$1" name="$2" host="$3" url="$4" code verbose_out
   verbose_out="$(curl_ai_via_unlock "$unlock_ip" "$host" \
     -o /dev/null -w '%{http_code}' --connect-timeout 8 --max-time 20 \
     -v "$url" 2>&1 || true)"
   code="$(printf '%s' "$verbose_out" | tail -n 1)"
 
-  # 有 HTTP 响应码 = 链路完全正常
-  if http_code_is_response "$code"; then
+  # 2xx/3xx/401 = 链路正常且服务接受
+  if http_code_is_ok "$code"; then
     print_ai_path_status "$name" ok "HTTPS 链路正常 HTTP $code"
     return 0
   fi
 
-  # 无 HTTP 码但 TLS 握手成功 = sniproxy 转发正常，目标服务主动断连（正常行为）
+  # 403/429/451 = 链路通了，但目标服务拒绝；这不是“解锁通过”
+  if http_code_is_blocked "$code"; then
+    print_ai_path_status "$name" blocked "链路可达但服务拒绝 HTTP $code（未确认解锁）"
+    return 0
+  fi
+
+  # 其他 HTTP 码（5xx 等）= 链路通了，服务端错误
+  if http_code_is_response "$code"; then
+    print_ai_path_status "$name" reachable "HTTPS 链路可达 HTTP $code（未确认解锁）"
+    return 0
+  fi
+
+  # 无 HTTP 码但 TLS 握手成功 = sniproxy 转发正常，目标服务主动断连
   if printf '%s' "$verbose_out" | grep -qE 'SSL connection using|TLSv1\.[0-9]|subject:|issuer:'; then
-    print_ai_path_status "$name" ok "TLS 握手成功（目标服务主动断连，链路正常）"
+    print_ai_path_status "$name" reachable "TLS 握手成功（未确认解锁）"
     return 0
   fi
 
   # openssl 兜底验证
   if check_tls_handshake "$unlock_ip" "$host"; then
-    print_ai_path_status "$name" ok "TLS 握手成功（openssl 验证）"
+    print_ai_path_status "$name" reachable "TLS 握手成功（未确认解锁）"
     return 0
   fi
 
@@ -611,20 +646,43 @@ check_kimi_unlock() {
 }
 
 check_all_ai_unlock_path() {
-  local unlock_ip="$1" ok_count=0 total=0
-  total=$((total + 1)); check_chatgpt_unlock "$unlock_ip" && ok_count=$((ok_count + 1))
-  total=$((total + 1)); check_ai_https_tunnel "$unlock_ip" "Google Gemini" "gemini.google.com" "https://gemini.google.com/" && ok_count=$((ok_count + 1))
-  total=$((total + 1)); check_ai_https_tunnel "$unlock_ip" "Claude" "claude.ai" "https://claude.ai/" && ok_count=$((ok_count + 1))
-  total=$((total + 1)); check_copilot_unlock "$unlock_ip" && ok_count=$((ok_count + 1))
-  total=$((total + 1)); check_ai_https_tunnel "$unlock_ip" "Perplexity" "www.perplexity.ai" "https://www.perplexity.ai/" && ok_count=$((ok_count + 1))
-  total=$((total + 1)); check_grok_unlock "$unlock_ip" && ok_count=$((ok_count + 1))
-  total=$((total + 1)); check_mistral_unlock "$unlock_ip" && ok_count=$((ok_count + 1))
-  total=$((total + 1)); check_character_unlock "$unlock_ip" && ok_count=$((ok_count + 1))
-  total=$((total + 1)); check_poe_unlock "$unlock_ip" && ok_count=$((ok_count + 1))
-  total=$((total + 1)); check_sora_unlock "$unlock_ip" && ok_count=$((ok_count + 1))
-  total=$((total + 1)); check_deepseek_unlock "$unlock_ip" && ok_count=$((ok_count + 1))
-  total=$((total + 1)); check_kimi_unlock "$unlock_ip" && ok_count=$((ok_count + 1))
-  printf "  HTTPS 链路通过: %s/%s\n" "$ok_count" "$total"
+  local unlock_ip="$1" unlocked_count=0 partial_count=0 reachable_count=0 blocked_count=0 restricted_count=0 fail_count=0 total=0
+  _check() {
+    local fn="$1"; shift
+    AI_PATH_LAST_STATUS=""
+    total=$((total + 1))
+    if "$fn" "$@"; then
+      case "$AI_PATH_LAST_STATUS" in
+        ok) unlocked_count=$((unlocked_count + 1)) ;;
+        partial) partial_count=$((partial_count + 1)) ;;
+        reachable) reachable_count=$((reachable_count + 1)) ;;
+        blocked) blocked_count=$((blocked_count + 1)) ;;
+        no) restricted_count=$((restricted_count + 1)) ;;
+        *) reachable_count=$((reachable_count + 1)) ;;
+      esac
+    else
+      fail_count=$((fail_count + 1))
+    fi
+  }
+  _check check_chatgpt_unlock "$unlock_ip"
+  _check check_ai_https_tunnel "$unlock_ip" "Google Gemini" "gemini.google.com" "https://gemini.google.com/"
+  _check check_ai_https_tunnel "$unlock_ip" "Claude" "claude.ai" "https://claude.ai/"
+  _check check_copilot_unlock "$unlock_ip"
+  _check check_ai_https_tunnel "$unlock_ip" "Perplexity" "www.perplexity.ai" "https://www.perplexity.ai/"
+  _check check_grok_unlock "$unlock_ip"
+  _check check_mistral_unlock "$unlock_ip"
+  _check check_character_unlock "$unlock_ip"
+  _check check_poe_unlock "$unlock_ip"
+  _check check_sora_unlock "$unlock_ip"
+  _check check_deepseek_unlock "$unlock_ip"
+  _check check_kimi_unlock "$unlock_ip"
+  unset -f _check
+  printf "  解锁确认: %s/%s\n" "$unlocked_count" "$total"
+  [ "$partial_count" -gt 0 ] && printf "  部分可用: %s 个（仍有端点受限）\n" "$partial_count" || true
+  [ "$blocked_count" -gt 0 ] && printf "  服务拒绝: %s 个（403/429/451 只表示链路到达，不代表解锁）\n" "$blocked_count" || true
+  [ "$restricted_count" -gt 0 ] && printf "  地区受限: %s 个\n" "$restricted_count" || true
+  [ "$reachable_count" -gt 0 ] && printf "  仅链路可达: %s 个（TLS/HTTP 可达，但未确认服务可用）\n" "$reachable_count" || true
+  [ "$fail_count" -gt 0 ] && printf "  链路失败: %s 个（需排查 sniproxy 或防火墙）\n" "$fail_count" || true
 }
 
 collect_ai_check_hosts() {
@@ -648,8 +706,9 @@ EOF
 
 show_unlock_summary() {
   clear
-  local server_ip
+  local server_ip whitelist_count
   server_ip="$(detect_public_ip)"
+  whitelist_count="$([ -s "$NODE_WHITELIST_FILE" ] && wc -l < "$NODE_WHITELIST_FILE" || echo 0)"
   printf "%b\n" "$(color 36 "======================================")"
   printf "%b\n" "$(color 36 "           运行状态检测")"
   printf "%b\n" "$(color 36 "======================================")"
@@ -665,14 +724,17 @@ show_unlock_summary() {
   
   echo "--------------------------------------"
   FIREWALL_BACKEND="$(firewall_detect_backend)"
-  printf "防火墙后端: %s (放行 IP 数: %s)\n" "$FIREWALL_BACKEND" "$([ -s "$NODE_WHITELIST_FILE" ] && wc -l < "$NODE_WHITELIST_FILE" || echo 0)"
+  printf "防火墙后端: %s (DNS 放行节点 IP 数: %s)\n" "$FIREWALL_BACKEND" "$whitelist_count"
+  if [ "$whitelist_count" -eq 0 ] 2>/dev/null; then
+    warn "当前没有放行任何节点 IP。远端节点直接使用本机 DNS 时会被防火墙丢弃。"
+  fi
   echo "--------------------------------------"
   printf "端口监听：\n"
   print_port_check udp 53 "dnsmasq"
   print_port_check tcp 53 "dnsmasq"
   print_port_check tcp 443 "sniproxy"
   echo "--------------------------------------"
-  printf "DNS 分流检测（查询本机 dnsmasq）：\n"
+  printf "解锁机本机 DNS 自检（不是节点机分流结果）：\n"
   local domain dns_ok_count=0 dns_total=0
   check_unlock_dns_forward "$server_ip" "example.com" || true
   while IFS= read -r domain; do
@@ -682,8 +744,10 @@ show_unlock_summary() {
   done < <(collect_ai_check_hosts)
   printf "  AI 域名命中: %s/%s\n" "$dns_ok_count" "$dns_total"
   echo "--------------------------------------"
-  printf "AI 解锁链路检测（经本机 SNIProxy）：\n"
+  printf "SNIProxy 连通性/服务响应检测（不是节点机分流结果）：\n"
   check_all_ai_unlock_path "$server_ip" || true
+  echo "--------------------------------------"
+  printf "节点机是否生效，请在节点机运行【分流诊断与测试】；关键结果应为 nameserver 127.0.0.1，AI 域名解析到 %s。\n" "$server_ip"
   echo "--------------------------------------"
 }
 
@@ -1418,18 +1482,156 @@ if ! curl -fsS --max-time 8 "$PANEL_URL/node-join?token=$TOKEN&ip=$NODE_IP&name=
   echo "请检查面板地址是否能访问: $PANEL_URL"
   exit 1
 fi
+if ! command -v dnsmasq >/dev/null 2>&1; then
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -y
+    DEBIAN_FRONTEND=noninteractive apt-get install -y dnsmasq dnsutils curl iproute2 e2fsprogs
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y dnsmasq bind-utils curl iproute e2fsprogs
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y dnsmasq bind-utils curl iproute e2fsprogs
+  elif command -v apk >/dev/null 2>&1; then
+    apk add --no-cache dnsmasq bind-tools curl iproute2 e2fsprogs
+  else
+    echo "未找到包管理器，无法安装 dnsmasq"
+    exit 1
+  fi
+fi
+mkdir -p /etc/dnsmasq.d
+cat > /etc/dnsmasq.d/ai_unlock_node.conf <<NODE_DNS
+# generated by ai_unlock node mode
+port=53
+listen-address=127.0.0.1
+bind-interfaces
+no-resolv
+server=1.1.1.1
+server=8.8.8.8
+cache-size=10000
+domain-needed
+bogus-priv
+local=/openai.com/
+address=/openai.com/$UNLOCK_IP
+local=/api.openai.com/
+address=/api.openai.com/$UNLOCK_IP
+local=/auth.openai.com/
+address=/auth.openai.com/$UNLOCK_IP
+local=/platform.openai.com/
+address=/platform.openai.com/$UNLOCK_IP
+local=/chatgpt.com/
+address=/chatgpt.com/$UNLOCK_IP
+local=/chat.openai.com/
+address=/chat.openai.com/$UNLOCK_IP
+local=/sora.com/
+address=/sora.com/$UNLOCK_IP
+local=/oaiusercontent.com/
+address=/oaiusercontent.com/$UNLOCK_IP
+local=/oaistatic.com/
+address=/oaistatic.com/$UNLOCK_IP
+local=/anthropic.com/
+address=/anthropic.com/$UNLOCK_IP
+local=/api.anthropic.com/
+address=/api.anthropic.com/$UNLOCK_IP
+local=/claude.ai/
+address=/claude.ai/$UNLOCK_IP
+local=/claude.com/
+address=/claude.com/$UNLOCK_IP
+local=/claudeusercontent.com/
+address=/claudeusercontent.com/$UNLOCK_IP
+local=/google.com/
+address=/google.com/$UNLOCK_IP
+local=/googleapis.com/
+address=/googleapis.com/$UNLOCK_IP
+local=/generativelanguage.googleapis.com/
+address=/generativelanguage.googleapis.com/$UNLOCK_IP
+local=/gstatic.com/
+address=/gstatic.com/$UNLOCK_IP
+local=/googleusercontent.com/
+address=/googleusercontent.com/$UNLOCK_IP
+local=/ggpht.com/
+address=/ggpht.com/$UNLOCK_IP
+local=/ytimg.com/
+address=/ytimg.com/$UNLOCK_IP
+local=/withgoogle.com/
+address=/withgoogle.com/$UNLOCK_IP
+local=/googletagmanager.com/
+address=/googletagmanager.com/$UNLOCK_IP
+local=/googlevideo.com/
+address=/googlevideo.com/$UNLOCK_IP
+local=/gemini.google.com/
+address=/gemini.google.com/$UNLOCK_IP
+local=/aistudio.google.com/
+address=/aistudio.google.com/$UNLOCK_IP
+local=/perplexity.ai/
+address=/perplexity.ai/$UNLOCK_IP
+local=/perplexity.com/
+address=/perplexity.com/$UNLOCK_IP
+local=/api.perplexity.ai/
+address=/api.perplexity.ai/$UNLOCK_IP
+local=/x.ai/
+address=/x.ai/$UNLOCK_IP
+local=/grok.com/
+address=/grok.com/$UNLOCK_IP
+local=/api.x.ai/
+address=/api.x.ai/$UNLOCK_IP
+local=/copilot.microsoft.com/
+address=/copilot.microsoft.com/$UNLOCK_IP
+local=/bing.com/
+address=/bing.com/$UNLOCK_IP
+local=/midjourney.com/
+address=/midjourney.com/$UNLOCK_IP
+local=/alpha.midjourney.com/
+address=/alpha.midjourney.com/$UNLOCK_IP
+local=/deepseek.com/
+address=/deepseek.com/$UNLOCK_IP
+local=/chat.deepseek.com/
+address=/chat.deepseek.com/$UNLOCK_IP
+local=/api.deepseek.com/
+address=/api.deepseek.com/$UNLOCK_IP
+local=/platform.deepseek.com/
+address=/platform.deepseek.com/$UNLOCK_IP
+local=/mistral.ai/
+address=/mistral.ai/$UNLOCK_IP
+local=/chat.mistral.ai/
+address=/chat.mistral.ai/$UNLOCK_IP
+local=/console.mistral.ai/
+address=/console.mistral.ai/$UNLOCK_IP
+local=/api.mistral.ai/
+address=/api.mistral.ai/$UNLOCK_IP
+local=/character.ai/
+address=/character.ai/$UNLOCK_IP
+local=/neo.character.ai/
+address=/neo.character.ai/$UNLOCK_IP
+local=/poe.com/
+address=/poe.com/$UNLOCK_IP
+local=/openrouter.ai/
+address=/openrouter.ai/$UNLOCK_IP
+local=/platform.openrouter.ai/
+address=/platform.openrouter.ai/$UNLOCK_IP
+local=/meta.ai/
+address=/meta.ai/$UNLOCK_IP
+local=/you.com/
+address=/you.com/$UNLOCK_IP
+local=/kimi.moonshot.cn/
+address=/kimi.moonshot.cn/$UNLOCK_IP
+local=/api.moonshot.cn/
+address=/api.moonshot.cn/$UNLOCK_IP
+NODE_DNS
 if command -v systemctl >/dev/null 2>&1; then
   systemctl stop systemd-resolved 2>/dev/null || true
   systemctl disable systemd-resolved 2>/dev/null || true
   systemctl mask systemd-resolved 2>/dev/null || true
+  systemctl enable dnsmasq >/dev/null 2>&1 || true
+  systemctl restart dnsmasq
+else
+  service dnsmasq restart 2>/dev/null || true
 fi
 chattr -i /etc/resolv.conf 2>/dev/null || true
 chattr -i /run/systemd/resolve/stub-resolv.conf 2>/dev/null || true
 chattr -i /run/systemd/resolve/resolv.conf 2>/dev/null || true
 rm -f /etc/resolv.conf
-printf 'nameserver %s\n' "$UNLOCK_IP" > /etc/resolv.conf
+printf 'nameserver 127.0.0.1\n' > /etc/resolv.conf
 chattr +i /etc/resolv.conf 2>/dev/null || true
-echo "节点机 DNS 已指向 $UNLOCK_IP"
+echo "节点机已启用本地 dnsmasq 分流，AI 域名指向 $UNLOCK_IP"
 echo "节点公网 IP: $NODE_IP（已提交到解锁机白名单）"
 if [ -L /etc/resolv.conf ]; then
   echo "警告: /etc/resolv.conf 仍然是 symlink -> $(readlink /etc/resolv.conf 2>/dev/null || true)"
@@ -1443,6 +1645,10 @@ else
 fi
 echo "当前 /etc/resolv.conf:"
 cat /etc/resolv.conf 2>/dev/null || true
+echo "检测: chatgpt.com 应解析到解锁机"
+dig @127.0.0.1 chatgpt.com A +time=3 +tries=1 +short 2>/dev/null || true
+echo "检测: example.com 应走普通 DNS"
+dig @127.0.0.1 example.com A +time=3 +tries=1 +short 2>/dev/null | head -n 1 || true
 "#
     );
     ([(axum::http::header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")], body).into_response()
@@ -1463,8 +1669,10 @@ TOKEN="{token}"
 NODE_IP="$(curl -k -fs4 --max-time 5 https://1.1.1.1/cdn-cgi/trace 2>/dev/null | awk -F= '/^ip=/ {{print $2; exit}}' || true)"
 [ -n "$NODE_IP" ] || NODE_IP="$(curl -fs4 --max-time 5 https://ifconfig.me 2>/dev/null || true)"
 chattr -i /etc/resolv.conf 2>/dev/null || true
+rm -f /etc/dnsmasq.d/ai_unlock_node.conf 2>/dev/null || true
 if command -v systemctl >/dev/null 2>&1; then
   systemctl unmask systemd-resolved 2>/dev/null || true
+  systemctl restart dnsmasq 2>/dev/null || true
 fi
 rm -f /etc/resolv.conf
 printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf
@@ -2004,7 +2212,9 @@ fn collect_domains() -> io::Result<Vec<String>> {
 fn sync_firewall(nodes: &[Node]) -> io::Result<()> {
     if command_exists("nft") {
         run_ignore("nft", &["add", "table", "inet", "ai_unlock"]);
-        run_ignore("nft", &["add", "set", "inet", "ai_unlock", "node_whitelist", "{ type ipv4_addr; flags interval; }"]);
+        if !run_status("nft", &["list", "set", "inet", "ai_unlock", "node_whitelist"]) {
+            run_ignore("nft", &["add", "set", "inet", "ai_unlock", "node_whitelist", "{ type ipv4_addr; flags interval; }"]);
+        }
         if run_status("nft", &["list", "chain", "inet", "ai_unlock", "input"]) {
             run_ignore("nft", &["flush", "chain", "inet", "ai_unlock", "input"]);
         } else {
@@ -2628,6 +2838,8 @@ write_public_resolv_conf() {
 backup_resolv_conf() { ensure_base_dir; if [ ! -f "$RESOLV_BACKUP" ]; then cp -a /etc/resolv.conf "$RESOLV_BACKUP" 2>/dev/null || true; fi; }
 restore_resolv_conf() {
   chattr -i /etc/resolv.conf 2>/dev/null || true
+  rm -f "$NODE_DNSMASQ_CONF" 2>/dev/null || true
+  if command_exists systemctl; then systemctl restart dnsmasq 2>/dev/null || true; else service dnsmasq restart 2>/dev/null || true; fi
   enable_systemd_resolved
   write_public_resolv_conf
   ok "已恢复公共 DNS: ${PUBLIC_DNS_SERVERS[*]}"
@@ -2768,23 +2980,73 @@ verify_node_resolv_conf() {
   fi
 }
 
+write_node_dnsmasq_conf() {
+  local unlock_ip="$1"
+  mkdir -p /etc/dnsmasq.d
+  {
+    printf '# generated by ai_unlock node mode\n'
+    printf 'port=53\n'
+    printf 'listen-address=127.0.0.1\n'
+    printf 'bind-interfaces\n'
+    printf 'no-resolv\n'
+    for dns in "${PUBLIC_DNS_SERVERS[@]}"; do printf 'server=%s\n' "$dns"; done
+    printf 'cache-size=10000\n'
+    printf 'domain-needed\n'
+    printf 'bogus-priv\n'
+    while IFS= read -r domain; do
+      [ -z "$domain" ] && continue
+      printf 'local=/%s/\n' "$domain"
+      printf 'address=/%s/%s\n' "$domain" "$unlock_ip"
+    done < <(collect_domains)
+  } > "$NODE_DNSMASQ_CONF"
+}
+
+install_node_dnsmasq() {
+  if command_exists dnsmasq; then return 0; fi
+  info "节点机未安装 dnsmasq，正在安装..."
+  install_packages dnsmasq dnsutils curl iproute2 e2fsprogs || return 1
+}
+
+restart_node_dnsmasq() {
+  service_enable dnsmasq
+  service_restart dnsmasq
+  if [ "$(service_status dnsmasq)" != "active" ]; then
+    warn "节点机 dnsmasq 未启动，请检查 53 端口是否被占用。"
+    show_service_status_detail dnsmasq
+    return 1
+  fi
+  return 0
+}
+
 set_node_dns() {
   read -r -p "输入【解锁机】公网 IP: " unlock_ip
   if [ -z "$unlock_ip" ]; then warn "不能为空。"; return; fi
+  install_node_dnsmasq || return 1
   backup_resolv_conf
   disable_systemd_resolved
-  write_node_resolv_conf "$unlock_ip"
-  ok "已设置 DNS: $unlock_ip"
-  verify_node_resolv_conf "$unlock_ip"
-  info "普通域名会由解锁机 dnsmasq 转发到公共 DNS；AI 域名会解析到解锁机。"
+  write_node_dnsmasq_conf "$unlock_ip"
+  restart_node_dnsmasq || return 1
+  write_node_resolv_conf "127.0.0.1"
+  ok "已启用节点本地分流 DNS"
+  verify_node_resolv_conf "127.0.0.1"
+  info "普通域名由节点本地 dnsmasq 转发；AI 域名解析到解锁机 $unlock_ip。"
 }
 
 test_node_dns() {
   local configured_dns="$(awk '/^nameserver/ {print $2; exit}' /etc/resolv.conf)"
   if [ -z "$configured_dns" ]; then warn "未配置 DNS！"; return; fi
+  local split_dns="$configured_dns"
+  local unlock_ip=""
+  if [ -f "$NODE_DNSMASQ_CONF" ]; then
+    unlock_ip="$(awk -F/ '/^address=\/[^/]+\/[0-9]+\./ {print $4; exit}' "$NODE_DNSMASQ_CONF" 2>/dev/null)"
+  fi
+  if [ -z "$unlock_ip" ] && [ "$configured_dns" != "127.0.0.1" ]; then
+    unlock_ip="$configured_dns"
+  fi
   local node_public_ip="$(detect_node_public_ip)"
   
   info "当前设定 DNS: $configured_dns"
+  if [ -n "$unlock_ip" ]; then info "当前解锁机 IP: $unlock_ip"; fi
   echo "--------------------------------------"
   info "系统 DNS 接管状态:"
   if command_exists systemctl; then
@@ -2803,9 +3065,15 @@ test_node_dns() {
     printf "  %b /etc/resolv.conf 不是 symlink\n" "$(color 32 "[正常]")"
   fi
   printf "  %b 首个 nameserver: %s\n" "$(color 36 "[信息]")" "$configured_dns"
+  printf "  %b 节点 dnsmasq: %s\n" "$(color 36 "[信息]")" "$(service_status dnsmasq)"
   echo "--------------------------------------"
   info "/etc/resolv.conf 实际内容:"
   cat /etc/resolv.conf 2>/dev/null || true
+  if [ -f "$NODE_DNSMASQ_CONF" ]; then
+    echo "--------------------------------------"
+    info "节点本地分流配置:"
+    sed -n '1,35p' "$NODE_DNSMASQ_CONF" 2>/dev/null || true
+  fi
   if command_exists resolvectl; then
     echo "--------------------------------------"
     printf "\n%b\n" "$(color 36 "resolvectl status")"
@@ -2816,7 +3084,31 @@ test_node_dns() {
   else
     warn "未能自动获取节点公网 IP；请手动确认解锁机白名单里添加的是节点公网 IP。"
   fi
-  info "将直接向 $configured_dns 发起 DNS 查询，避免被系统备用 DNS 干扰。"
+  info "将直接向 $split_dns 发起 DNS 查询，避免被系统备用 DNS 干扰。"
+  echo "--------------------------------------"
+  info "基础连通性:"
+  if command_exists dig; then
+    if dig @"$split_dns" example.com A +time=3 +tries=1 +short >/tmp/ai_unlock_node_example_dns.log 2>/dev/null && grep -Eq '^[0-9]+\.' /tmp/ai_unlock_node_example_dns.log; then
+      printf "  %b DNS 普通域名转发正常: %s\n" "$(color 32 "[成功]")" "$(awk '/^[0-9]+\./ {print; exit}' /tmp/ai_unlock_node_example_dns.log)"
+    else
+      printf "  %b DNS 普通域名转发失败\n" "$(color 31 "[失败]")"
+      if [ "$split_dns" = "127.0.0.1" ]; then
+        warn "请检查节点机 dnsmasq 是否 active，以及 /etc/dnsmasq.d/ai_unlock_node.conf 的上游 DNS 是否可达。"
+      else
+        warn "请检查节点到解锁机 53/UDP 是否放行；云防火墙和解锁机白名单都要允许节点公网 IP。"
+      fi
+    fi
+  fi
+  if [ -n "$unlock_ip" ]; then
+    if command_exists curl; then
+      if curl -k -sS --connect-timeout 6 --max-time 10 --resolve "chatgpt.com:443:$unlock_ip" -o /dev/null "https://chatgpt.com/favicon.ico" 2>/dev/null; then
+        printf "  %b 节点到解锁机 443/SNIProxy 可达\n" "$(color 32 "[成功]")"
+      else
+        printf "  %b 节点到解锁机 443/SNIProxy 不通或被目标拒绝\n" "$(color 31 "[失败]")"
+        warn "请检查解锁机 sniproxy 是否 active、云防火墙是否放行 TCP 443。"
+      fi
+    fi
+  fi
   echo "--------------------------------------"
   info "分流解析状态:"
 
@@ -2824,20 +3116,24 @@ test_node_dns() {
   while IFS= read -r domain; do
     [ -z "$domain" ] && continue
     local resolved=""
-    if command_exists dig; then resolved="$(dig @"$configured_dns" "$domain" A +time=3 +tries=1 +short 2>/dev/null | awk '/^[0-9]+\./ {print; exit}')"; fi
-    if [ -z "$resolved" ] && command_exists nslookup; then resolved="$(nslookup -type=A "$domain" "$configured_dns" 2>/dev/null | awk '/^Address: / {print $2}' | grep -E '^[0-9]+\.' | tail -n 1)"; fi
+    if command_exists dig; then resolved="$(dig @"$split_dns" "$domain" A +time=3 +tries=1 +short 2>/dev/null | awk '/^[0-9]+\./ {print; exit}')"; fi
+    if [ -z "$resolved" ] && command_exists nslookup; then resolved="$(nslookup -type=A "$domain" "$split_dns" 2>/dev/null | awk '/^Address: / {print $2}' | grep -E '^[0-9]+\.' | tail -n 1)"; fi
     if [ -z "$resolved" ] && command_exists ping; then resolved="$(ping -c 1 -W 1 "$domain" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)"; fi
 
     if [ -n "$resolved" ]; then
-      if [ "$resolved" = "$configured_dns" ]; then dns_ok_count=$((dns_ok_count + 1)); printf "  %b %s -> %s\n" "$(color 32 "[成功]")" "$domain" "$resolved"
-      else dns_miss_count=$((dns_miss_count + 1)); printf "  %b %s -> %s（未命中解锁机）\n" "$(color 31 "[失败]")" "$domain" "$resolved"; fi
+      if [ -n "$unlock_ip" ] && [ "$resolved" = "$unlock_ip" ]; then dns_ok_count=$((dns_ok_count + 1)); printf "  %b %s -> %s\n" "$(color 32 "[成功]")" "$domain" "$resolved"
+      else dns_miss_count=$((dns_miss_count + 1)); printf "  %b %s -> %s（未命中解锁机 ${unlock_ip:-未知}）\n" "$(color 31 "[失败]")" "$domain" "$resolved"; fi
     else dns_timeout_count=$((dns_timeout_count + 1)); printf "  %b %s -> 无 A 记录响应\n" "$(color 33 "[无响应]")" "$domain"; fi
   done < <(collect_ai_check_hosts)
   if [ "$dns_ok_count" -eq 0 ] && [ "$dns_timeout_count" -gt 0 ]; then
     warn "AI 域名 A 记录无响应：DNS 分流未返回结果。"
-    [ -n "$node_public_ip" ] && warn "当前节点公网 IP 是 $node_public_ip，请确认它已经在解锁机白名单中。"
+    if [ "$split_dns" = "127.0.0.1" ]; then
+      warn "当前使用节点本地分流，请检查节点机 dnsmasq 配置是否存在 address=/域名/$unlock_ip。"
+    else
+      [ -n "$node_public_ip" ] && warn "当前节点公网 IP 是 $node_public_ip，请确认它已经在解锁机白名单中。"
+    fi
   elif [ "$dns_miss_count" -gt 0 ]; then
-    warn "AI 域名没有解析到解锁机：请在解锁机重新生成配置，并确认 dnsmasq 配置里有 local=/域名/ 和 address=/域名/$configured_dns。"
+    warn "AI 域名没有解析到解锁机：请重新设置节点分流 DNS，并确认配置里有 address=/域名/$unlock_ip。"
   fi
 
   echo "--------------------------------------"
@@ -2875,10 +3171,10 @@ test_node_dns() {
 
   echo "--------------------------------------"
   info "AI DNS 命中判定:"
-  check_all_ai_dns_hits "$configured_dns" "$configured_dns" || true
+  check_all_ai_dns_hits "$split_dns" "${unlock_ip:-$configured_dns}" || true
   echo "--------------------------------------"
   info "AI 解锁链路检测（经解锁机 SNIProxy）:"
-  check_all_ai_unlock_path "$configured_dns" || true
+  check_all_ai_unlock_path "${unlock_ip:-$configured_dns}" || true
 }
 
 unlock_menu() {
@@ -2921,7 +3217,7 @@ node_menu() {
     printf "%b\n" "$(color 36 "======================================")"
     printf "%b\n" "$(color 36 "           配置节点机")"
     printf "%b\n" "$(color 36 "======================================")"
-    printf "  %b 指向解锁机 DNS\n" "$(color 32 "1.")"
+    printf "  %b 启用本地分流 DNS\n" "$(color 32 "1.")"
     printf "  %b 恢复原生 DNS\n" "$(color 32 "2.")"
     printf "  %b 分流诊断与测试\n" "$(color 32 "3.")"
     printf "  %b 查看当前 DNS\n" "$(color 32 "4.")"
