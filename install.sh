@@ -1225,6 +1225,15 @@ set -e
 UNLOCK_IP="{ip}"
 PANEL_URL="{panel}"
 TOKEN="{token}"
+NODE_IP="$(curl -k -fs4 --max-time 5 https://1.1.1.1/cdn-cgi/trace 2>/dev/null | awk -F= '/^ip=/ {{print $2; exit}}' || true)"
+[ -n "$NODE_IP" ] || NODE_IP="$(curl -fs4 --max-time 5 https://ifconfig.me 2>/dev/null || true)"
+NODE_NAME="$(hostname 2>/dev/null | tr -cd 'A-Za-z0-9_.-' || echo node)"
+[ -n "$NODE_NAME" ] || NODE_NAME="node"
+if [ -z "$NODE_IP" ]; then
+  echo "未能获取节点公网 IP，未修改 DNS"
+  exit 1
+fi
+curl -fsS --max-time 8 "$PANEL_URL/node-join?token=$TOKEN&ip=$NODE_IP&name=$NODE_NAME" >/dev/null
 if command -v systemctl >/dev/null 2>&1 && systemctl is-active systemd-resolved >/dev/null 2>&1; then
   systemctl stop systemd-resolved 2>/dev/null || true
   systemctl disable systemd-resolved 2>/dev/null || true
@@ -1233,13 +1242,6 @@ chattr -i /etc/resolv.conf 2>/dev/null || true
 rm -f /etc/resolv.conf
 printf 'nameserver %s\n' "$UNLOCK_IP" > /etc/resolv.conf
 chattr +i /etc/resolv.conf 2>/dev/null || true
-NODE_IP="$(curl -k -fs4 --max-time 5 https://1.1.1.1/cdn-cgi/trace 2>/dev/null | awk -F= '/^ip=/ {{print $2; exit}}' || true)"
-[ -n "$NODE_IP" ] || NODE_IP="$(curl -fs4 --max-time 5 https://ifconfig.me 2>/dev/null || true)"
-NODE_NAME="$(hostname 2>/dev/null | tr -cd 'A-Za-z0-9_.-' || echo node)"
-[ -n "$NODE_NAME" ] || NODE_NAME="node"
-if [ -n "$NODE_IP" ]; then
-  curl -fsS --max-time 8 "$PANEL_URL/node-join?token=$TOKEN&ip=$NODE_IP&name=$NODE_NAME" >/dev/null 2>&1 || true
-fi
 echo "节点机 DNS 已指向 $UNLOCK_IP"
 "#
     );
@@ -1365,17 +1367,21 @@ fn nodes_html(session: &Session, nodes: &[Node], q: &HashMap<String, String>, ho
         .iter()
         .map(|n| {
             format!(
-                r#"<tr>
-<td><code>{ip}</code></td>
-<td><form class="inline" method="post" action="/nodes/edit"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="id" value="{id}"><input name="ip" value="{ip}"><input name="name" value="{name}" placeholder="名称"><input name="note" value="{note}" placeholder="备注"><button>保存</button></form></td>
-<td class="muted">{created}</td>
-<td><form method="post" action="/nodes/delete"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="id" value="{id}"><button class="ghost danger">删除</button></form></td>
-</tr>"#,
+                r#"<div class="node-row">
+  <div class="node-name">{name_display}</div>
+  <code class="node-ip">{ip}</code>
+  <div class="node-note">{note_display}</div>
+  <div class="node-actions">
+    <button type="button" class="ghost edit-node" data-id="{id}" data-ip="{ip}" data-name="{name}" data-note="{note}">编辑</button>
+    <form method="post" action="/nodes/delete"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="id" value="{id}"><button class="ghost danger">删除</button></form>
+  </div>
+</div>"#,
                 ip = html(&n.ip),
                 id = html(&n.id),
                 name = html(&n.name),
                 note = html(&n.note),
-                created = html(&n.created),
+                name_display = if n.name.is_empty() { "未命名".to_string() } else { html(&n.name) },
+                note_display = if n.note.is_empty() { "无备注".to_string() } else { html(&n.note) },
                 csrf = html(&session.csrf)
             )
         })
@@ -1390,7 +1396,18 @@ fn nodes_html(session: &Session, nodes: &[Node], q: &HashMap<String, String>, ho
   <div class="glass"><div class="head"><div><h2>添加节点</h2><p>添加后自动应用放行规则。</p></div></div><form class="stack" method="post" action="/nodes/add"><input type="hidden" name="csrf" value="{csrf}"><label>节点公网 IP<input name="ip" required placeholder="1.2.3.4"></label><label>名称<input name="name"></label><label>备注<input name="note"></label><button>添加节点</button></form></div>
   <div class="glass"><div class="head"><div><h2>批量添加</h2><p>每行一个 IP，可跟名称。</p></div></div><form class="stack" method="post" action="/nodes/batch-add"><input type="hidden" name="csrf" value="{csrf}"><textarea name="items" rows="7" placeholder="1.2.3.4 节点A&#10;5.6.7.8 节点B"></textarea><button>批量添加</button></form></div>
 </section>
-<section class="glass"><div class="head"><div><h2>节点列表</h2><p>共 {count} 个。</p></div></div><div class="table"><table><thead><tr><th>IP</th><th>编辑</th><th>添加时间</th><th></th></tr></thead><tbody>{rows}</tbody></table></div></section>
+<section class="glass"><div class="head"><div><h2>节点列表</h2><p>共 {count} 个。</p></div></div><div class="node-list">{rows}</div></section>
+<div class="modal-backdrop" id="node-edit-modal" hidden>
+  <section class="settings-modal" role="dialog" aria-modal="true" aria-labelledby="node-edit-title">
+    <div class="head"><div><h2 id="node-edit-title">编辑节点</h2></div><button type="button" class="ghost" data-close-node-edit>关闭</button></div>
+    <form class="stack" method="post" action="/nodes/edit"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="id" id="edit-node-id">
+      <label>节点公网 IP<input name="ip" id="edit-node-ip" required></label>
+      <label>名称<input name="name" id="edit-node-name"></label>
+      <label>备注<input name="note" id="edit-node-note"></label>
+      <button>保存</button>
+    </form>
+  </section>
+</div>
 <section class="glass"><div class="head"><div><h2>批量删除</h2><p>输入要删除的 IP。</p></div></div><form class="stack" method="post" action="/nodes/batch-delete"><input type="hidden" name="csrf" value="{csrf}"><textarea name="items" rows="5"></textarea><button class="danger">批量删除</button></form></section>"#,
         flash = flash(q),
         csrf = html(&session.csrf),
@@ -1436,13 +1453,16 @@ fn domains_html(session: &Session, custom: &[String], q: &HashMap<String, String
 }
 
 fn layout(title: &str, session: &Session, body: &str) -> String {
+    let dash_active = if title == "仪表盘" { "active" } else { "" };
+    let nodes_active = if title == "节点管理" { "active" } else { "" };
+    let domains_active = if title == "域名池" { "active" } else { "" };
     format!(
         r#"<!doctype html>
 <html lang="zh-CN">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} - AI Unlock</title><style>{css}</style></head>
 <body>
 <div class="bg"></div>
-<header class="nav"><div class="brand">AI Unlock</div><nav><a href="/">仪表盘</a><a href="/nodes">节点管理</a><a href="/domains">域名池</a></nav><button type="button" class="ghost settings-toggle">设置</button></header>
+<header class="nav"><div class="brand">AI Unlock</div><nav><a class="{dash_active}" href="/">仪表盘</a><a class="{nodes_active}" href="/nodes">节点管理</a><a class="{domains_active}" href="/domains">域名池</a></nav><button type="button" class="ghost settings-toggle">设置</button></header>
 <div class="modal-backdrop" id="settings-modal" hidden>
   <section class="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
     <div class="head"><div><h2 id="settings-title">设置</h2></div><button type="button" class="ghost" data-close-settings>关闭</button></div>
@@ -1476,7 +1496,27 @@ if (settingsModal) {{
   }});
   const settingsErrors = ['csrf', 'bad_password', 'bad_user', 'weak_password', 'pass_mismatch'];
   const params = new URLSearchParams(window.location.search);
-  if (settingsErrors.includes(params.get('err'))) openSettings();
+    if (settingsErrors.includes(params.get('err'))) openSettings();
+}}
+const nodeEditModal = document.getElementById('node-edit-modal');
+const closeNodeEdit = () => {{
+  if (nodeEditModal) nodeEditModal.hidden = true;
+}};
+document.querySelectorAll('.edit-node').forEach((button) => {{
+  button.addEventListener('click', () => {{
+    if (!nodeEditModal) return;
+    document.getElementById('edit-node-id').value = button.dataset.id || '';
+    document.getElementById('edit-node-ip').value = button.dataset.ip || '';
+    document.getElementById('edit-node-name').value = button.dataset.name || '';
+    document.getElementById('edit-node-note').value = button.dataset.note || '';
+    nodeEditModal.hidden = false;
+  }});
+}});
+document.querySelectorAll('[data-close-node-edit]').forEach((button) => button.addEventListener('click', closeNodeEdit));
+if (nodeEditModal) {{
+  nodeEditModal.addEventListener('click', (event) => {{
+    if (event.target === nodeEditModal) closeNodeEdit();
+  }});
 }}
 document.querySelectorAll('.copy-command').forEach((button) => {{
   button.addEventListener('click', async () => {{
@@ -1518,6 +1558,9 @@ document.querySelectorAll('.copy-command').forEach((button) => {{
         css = CSS,
         csrf = html(&session.csrf),
         username = html(&current_username()),
+        dash_active = dash_active,
+        nodes_active = nodes_active,
+        domains_active = domains_active,
         body = body
     )
 }
@@ -2040,7 +2083,7 @@ fn shell_word(input: &str) -> String {
 
 const CSS: &str = r#"
 :root{--primary:#3b82f6;--danger:#ef4444;--success:#10b981;--warn:#d97706;--ink:#374151;--muted:#6b7280}
-*{box-sizing:border-box}body{margin:0;min-height:100vh;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--ink);background:#e9eef6;letter-spacing:0}.bg{position:fixed;inset:0;z-index:-1;background:linear-gradient(135deg,#d8e6f7 0%,#eef2f7 45%,#d7efe7 100%)}.nav{position:sticky;top:0;z-index:10;background:rgba(255,255,255,.82);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);border-bottom:1px solid rgba(209,213,219,.75);padding:8px 20px;display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:10px}.brand{font-weight:800;font-size:16px;white-space:nowrap}.nav nav{display:flex;gap:6px;justify-content:center;flex-wrap:nowrap;overflow-x:auto}.nav a{color:var(--ink);text-decoration:none;border-radius:8px;padding:6px 8px;white-space:nowrap;font-size:14px}.nav a:hover{background:rgba(255,255,255,.72)}.wrap{width:min(1180px,94vw);margin:24px auto 40px;display:grid;gap:18px}.page-title h1{margin:0;font-size:28px}.grid{display:grid;gap:16px}.metrics{grid-template-columns:repeat(4,minmax(0,1fr))}.split{grid-template-columns:repeat(2,minmax(0,1fr))}.glass,.metric,.login-box{background:rgba(255,255,255,.46);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,.62);border-radius:14px;box-shadow:0 8px 30px rgba(31,41,55,.06);padding:20px}.metric span{display:block;color:var(--muted);font-size:13px}.metric strong{display:block;margin-top:6px;font-size:24px;overflow-wrap:anywhere}.head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:15px}.head h2{margin:0;font-size:18px}.head p{margin:3px 0 0;color:var(--muted)}button{border:0;border-radius:10px;background:rgba(59,130,246,.9);color:white;padding:10px 15px;font-weight:700;cursor:pointer;white-space:nowrap}button:hover{filter:brightness(.96);transform:translateY(-1px)}button.danger,.danger{background:rgba(239,68,68,.9);color:white}button.ghost,.ghost{background:rgba(255,255,255,.65);color:var(--ink)}.nav button{padding:6px 9px}.actions{display:flex;gap:10px;flex-wrap:wrap}.actions form{margin:0}input,textarea{width:100%;border:1px solid rgba(255,255,255,.55);background:rgba(255,255,255,.62);border-radius:10px;padding:11px 12px;color:var(--ink);outline:none}input:focus,textarea:focus{background:rgba(255,255,255,.86);border-color:#93c5fd}textarea{resize:vertical}.stack{display:grid;gap:12px}label{display:grid;gap:6px;color:var(--muted)}.row{display:grid;grid-template-columns:1fr auto;gap:10px}.inline{display:grid;grid-template-columns:135px 1fr 1fr auto;gap:8px}.table{overflow:auto}table{width:100%;border-collapse:separate;border-spacing:0 10px}th{color:var(--muted);text-align:left;font-size:13px;padding:0 10px}td{background:rgba(255,255,255,.42);padding:10px;border-top:1px solid rgba(255,255,255,.44);border-bottom:1px solid rgba(255,255,255,.44)}td:first-child{border-left:1px solid rgba(255,255,255,.44);border-radius:12px 0 0 12px}td:last-child{border-right:1px solid rgba(255,255,255,.44);border-radius:0 12px 12px 0}code,.cmd{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.cmd{margin:0;background:rgba(15,23,42,.88);color:#eef6ff;border-radius:12px;padding:15px;white-space:pre-wrap;overflow:auto}.checks{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.check{display:flex;align-items:center;justify-content:space-between;gap:12px;background:rgba(255,255,255,.46);border:1px solid rgba(255,255,255,.52);border-radius:12px;padding:10px 12px}.check strong{overflow-wrap:anywhere;text-align:right}.ok{color:var(--success)}.bad{color:var(--danger)}.warn{color:var(--warn)}.muted{color:var(--muted)}.alert{border-radius:12px;padding:11px 13px;background:rgba(255,255,255,.58);border:1px solid rgba(255,255,255,.65)}.alert.ok{color:#047857}.alert.bad{color:#b91c1c}.pills{display:flex;flex-wrap:wrap;gap:8px}.pill{background:rgba(255,255,255,.45);border:1px solid rgba(255,255,255,.55);border-radius:999px;padding:7px 11px}.domain{display:flex;align-items:center;justify-content:space-between;background:rgba(255,255,255,.42);border:1px solid rgba(255,255,255,.5);border-radius:12px;padding:10px 12px;margin-bottom:8px}.modal-backdrop{position:fixed;inset:0;z-index:50;display:grid;place-items:center;padding:20px;background:rgba(15,23,42,.32);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}.modal-backdrop[hidden]{display:none}.settings-modal{width:min(440px,92vw);display:grid;gap:14px;background:rgba(255,255,255,.9);border:1px solid rgba(255,255,255,.75);border-radius:14px;box-shadow:0 20px 60px rgba(15,23,42,.18);padding:20px}.settings-modal form{margin:0}.login{min-height:100vh;display:grid;place-items:center;padding:24px}.login-box{width:min(390px,92vw);display:grid;gap:16px;text-align:left}.login-box h1{margin:0;font-size:28px}.login-box p{margin:0;color:var(--muted)}@media(max-width:780px){.nav{position:sticky;grid-template-columns:auto minmax(0,1fr) auto;gap:6px;padding:7px 10px}.brand{font-size:15px}.nav nav{justify-content:flex-start;gap:4px;overflow-x:auto;flex-wrap:nowrap;padding-bottom:0}.nav a{padding:5px 6px;font-size:13px}.nav button{padding:5px 7px;font-size:13px}.modal-backdrop{align-items:flex-start;padding-top:58px}.settings-modal{max-height:calc(100vh - 80px);overflow:auto}.wrap{margin:16px auto;width:94vw}.page-title h1{font-size:22px}.metrics,.split,.checks{grid-template-columns:1fr}.inline{grid-template-columns:1fr}.actions button{flex:1;min-width:138px}.quick-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.quick-actions form{min-width:0}.quick-actions button{width:100%;min-width:0!important;padding:8px 5px;font-size:13px}.head p{display:none}.check{min-height:48px}.check span{min-width:42px}th{display:none}tr,td{display:block}td{border:0!important;border-radius:0!important}td:first-child{border-radius:12px 12px 0 0!important}td:last-child{border-radius:0 0 12px 12px!important}}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--ink);background:#e9eef6;letter-spacing:0}.bg{position:fixed;inset:0;z-index:-1;background:linear-gradient(135deg,#d8e6f7 0%,#eef2f7 45%,#d7efe7 100%)}.nav{position:sticky;top:0;z-index:10;background:rgba(255,255,255,.86);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);border-bottom:1px solid rgba(209,213,219,.75);padding:8px 20px;display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:12px}.brand{font-weight:800;font-size:16px;white-space:nowrap}.nav nav{display:flex;gap:4px;justify-content:flex-start;flex-wrap:nowrap;overflow-x:auto}.nav a{color:var(--ink);text-decoration:none;border-radius:8px;padding:6px 10px;white-space:nowrap;font-size:14px}.nav a:hover{background:rgba(255,255,255,.72)}.nav a.active{background:rgba(59,130,246,.12);color:#1d4ed8;font-weight:800}.wrap{width:min(1180px,94vw);margin:24px auto 40px;display:grid;gap:18px}.page-title h1{margin:0;font-size:28px}.grid{display:grid;gap:16px}.metrics{grid-template-columns:repeat(4,minmax(0,1fr))}.split{grid-template-columns:repeat(2,minmax(0,1fr))}.glass,.metric,.login-box{background:rgba(255,255,255,.46);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,.62);border-radius:14px;box-shadow:0 8px 30px rgba(31,41,55,.06);padding:20px}.metric span{display:block;color:var(--muted);font-size:13px}.metric strong{display:block;margin-top:6px;font-size:24px;overflow-wrap:anywhere}.head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:15px}.head h2{margin:0;font-size:18px}.head p{margin:3px 0 0;color:var(--muted)}button{border:0;border-radius:10px;background:rgba(59,130,246,.9);color:white;padding:10px 15px;font-weight:700;cursor:pointer;white-space:nowrap}button:hover{filter:brightness(.96);transform:translateY(-1px)}button.danger,.danger{background:rgba(239,68,68,.9);color:white}button.ghost,.ghost{background:rgba(255,255,255,.65);color:var(--ink)}.nav button{padding:6px 10px}.actions{display:flex;gap:10px;flex-wrap:wrap}.actions form{margin:0}input,textarea{width:100%;border:1px solid rgba(255,255,255,.55);background:rgba(255,255,255,.62);border-radius:10px;padding:11px 12px;color:var(--ink);outline:none}input:focus,textarea:focus{background:rgba(255,255,255,.86);border-color:#93c5fd}textarea{resize:vertical}.stack{display:grid;gap:12px}label{display:grid;gap:6px;color:var(--muted)}.row{display:grid;grid-template-columns:1fr auto;gap:10px}.inline{display:grid;grid-template-columns:135px 1fr 1fr auto;gap:8px}.table{overflow:auto}table{width:100%;border-collapse:separate;border-spacing:0 10px}th{color:var(--muted);text-align:left;font-size:13px;padding:0 10px}td{background:rgba(255,255,255,.42);padding:10px;border-top:1px solid rgba(255,255,255,.44);border-bottom:1px solid rgba(255,255,255,.44)}td:first-child{border-left:1px solid rgba(255,255,255,.44);border-radius:12px 0 0 12px}td:last-child{border-right:1px solid rgba(255,255,255,.44);border-radius:0 12px 12px 0}code,.cmd{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.cmd{margin:0;background:rgba(15,23,42,.88);color:#eef6ff;border-radius:12px;padding:15px;white-space:pre-wrap;overflow:auto}.node-list{display:grid;gap:8px}.node-row{display:grid;grid-template-columns:minmax(100px,1fr) minmax(130px,1.2fr) minmax(120px,1fr) auto;align-items:center;gap:12px;background:rgba(255,255,255,.42);border:1px solid rgba(255,255,255,.5);border-radius:12px;padding:10px 12px}.node-name{font-weight:800;overflow-wrap:anywhere}.node-ip,.node-note{overflow-wrap:anywhere}.node-note{color:var(--muted)}.node-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px}.node-actions form{margin:0}.checks{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.check{display:flex;align-items:center;justify-content:space-between;gap:12px;background:rgba(255,255,255,.46);border:1px solid rgba(255,255,255,.52);border-radius:12px;padding:10px 12px}.check strong{overflow-wrap:anywhere;text-align:right}.ok{color:var(--success)}.bad{color:var(--danger)}.warn{color:var(--warn)}.muted{color:var(--muted)}.alert{border-radius:12px;padding:11px 13px;background:rgba(255,255,255,.58);border:1px solid rgba(255,255,255,.65)}.alert.ok{color:#047857}.alert.bad{color:#b91c1c}.pills{display:flex;flex-wrap:wrap;gap:8px}.pill{background:rgba(255,255,255,.45);border:1px solid rgba(255,255,255,.55);border-radius:999px;padding:7px 11px}.domain{display:flex;align-items:center;justify-content:space-between;background:rgba(255,255,255,.42);border:1px solid rgba(255,255,255,.5);border-radius:12px;padding:10px 12px;margin-bottom:8px}.modal-backdrop{position:fixed;inset:0;z-index:50;display:grid;place-items:center;padding:20px;background:rgba(15,23,42,.32);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}.modal-backdrop[hidden]{display:none}.settings-modal{width:min(440px,92vw);display:grid;gap:14px;background:rgba(255,255,255,.9);border:1px solid rgba(255,255,255,.75);border-radius:14px;box-shadow:0 20px 60px rgba(15,23,42,.18);padding:20px}.settings-modal form{margin:0}.login{min-height:100vh;display:grid;place-items:center;padding:24px}.login-box{width:min(390px,92vw);display:grid;gap:16px;text-align:left}.login-box h1{margin:0;font-size:28px}.login-box p{margin:0;color:var(--muted)}@media(max-width:780px){.nav{position:sticky;grid-template-columns:auto minmax(0,1fr) auto;gap:6px;padding:7px 10px}.brand{font-size:15px}.nav nav{justify-content:flex-start;gap:4px;overflow-x:auto;flex-wrap:nowrap;padding-bottom:0}.nav a{padding:5px 7px;font-size:13px}.nav button{padding:5px 7px;font-size:13px}.modal-backdrop{align-items:flex-start;padding-top:58px}.settings-modal{max-height:calc(100vh - 80px);overflow:auto}.wrap{margin:16px auto;width:94vw}.page-title h1{font-size:22px}.metrics,.split,.checks{grid-template-columns:1fr}.inline{grid-template-columns:1fr}.actions button{flex:1;min-width:138px}.quick-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.quick-actions form{min-width:0}.quick-actions button{width:100%;min-width:0!important;padding:8px 5px;font-size:13px}.node-row{grid-template-columns:1fr auto;gap:8px}.node-ip,.node-note{grid-column:1 / -1}.node-actions{grid-row:1;grid-column:2;align-self:start}.head p{display:none}.check{min-height:48px}.check span{min-width:42px}th{display:none}tr,td{display:block}td{border:0!important;border-radius:0!important}td:first-child{border-radius:12px 12px 0 0!important}td:last-child{border-radius:0 0 12px 12px!important}}
 "#;
 AI_UNLOCK_PANEL_MAIN_EOF
   printf '%s
@@ -2502,7 +2545,7 @@ test_node_dns() {
     else dns_timeout_count=$((dns_timeout_count + 1)); printf "  %b %s -> 无 A 记录响应\n" "$(color 33 "[无响应]")" "$domain"; fi
   done < <(collect_ai_check_hosts)
   if [ "$dns_ok_count" -eq 0 ] && [ "$dns_timeout_count" -gt 0 ]; then
-    warn "AI 域名 A 记录无响应：请在解锁机白名单添加【节点机公网 IP】，并在云服务商安全组放行 UDP/TCP 53。"
+    warn "AI 域名 A 记录无响应：请确认解锁机白名单里是【节点机公网 IP】，并重新同步防火墙规则。"
     [ -n "$node_public_ip" ] && warn "当前节点公网 IP 是 $node_public_ip，请确认它已经在解锁机白名单中。"
   elif [ "$dns_miss_count" -gt 0 ]; then
     warn "AI 域名没有解析到解锁机：请在解锁机重新生成配置，并确认 dnsmasq 配置里有 local=/域名/ 和 address=/域名/$configured_dns。"
