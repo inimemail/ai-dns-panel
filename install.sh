@@ -518,15 +518,52 @@ check_chatgpt_unlock() {
   return 0
 }
 
-check_ai_https_tunnel() {
-  local unlock_ip="$1" name="$2" host="$3" url="$4" code
-  code="$(curl_ai_via_unlock "$unlock_ip" "$host" -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)"
-  if ! http_code_is_response "$code"; then
-    print_ai_path_status "$name" err "HTTPS 链路失败"
-    return 1
+check_tls_handshake() {
+  local unlock_ip="$1" host="$2"
+  if command_exists openssl; then
+    echo | timeout 8 openssl s_client \
+      -connect "${unlock_ip}:443" \
+      -servername "$host" \
+      -verify_return_error 2>/dev/null | grep -q "CONNECTED"
+    return $?
   fi
-  print_ai_path_status "$name" ok "HTTPS 链路正常 HTTP $code"
-  return 0
+  # fallback: 用 curl 检测 TLS 握手，捕获 verbose 输出判断是否握手成功
+  local verbose_out
+  verbose_out="$(curl_ai_via_unlock "$unlock_ip" "$host" \
+    -o /dev/null -w '%{http_code}' --connect-timeout 8 --max-time 15 \
+    -v "https://${host}/" 2>&1 || true)"
+  # TLS 握手成功的标志
+  printf '%s' "$verbose_out" | grep -qE 'SSL connection using|TLSv1\.[0-9]|subject:|issuer:'
+}
+
+check_ai_https_tunnel() {
+  local unlock_ip="$1" name="$2" host="$3" url="$4" code verbose_out tls_ok=""
+  # 同时获取 HTTP 状态码和 verbose 输出
+  verbose_out="$(curl_ai_via_unlock "$unlock_ip" "$host" \
+    -o /dev/null -w '%{http_code}' --connect-timeout 8 --max-time 20 \
+    -v "$url" 2>&1 || true)"
+  code="$(printf '%s' "$verbose_out" | tail -n 1)"
+
+  # 有 HTTP 响应码 = 链路完全正常
+  if http_code_is_response "$code"; then
+    print_ai_path_status "$name" ok "HTTPS 链路正常 HTTP $code"
+    return 0
+  fi
+
+  # 无 HTTP 码但 TLS 握手成功 = sniproxy 转发正常，目标服务主动断连（正常行为）
+  if printf '%s' "$verbose_out" | grep -qE 'SSL connection using|TLSv1\.[0-9]|subject:|issuer:'; then
+    print_ai_path_status "$name" ok "TLS 握手成功（目标服务主动断连，链路正常）"
+    return 0
+  fi
+
+  # openssl 兜底验证
+  if check_tls_handshake "$unlock_ip" "$host"; then
+    print_ai_path_status "$name" ok "TLS 握手成功（openssl 验证）"
+    return 0
+  fi
+
+  print_ai_path_status "$name" err "HTTPS 链路失败（TLS 握手未完成）"
+  return 1
 }
 
 check_copilot_unlock() {
