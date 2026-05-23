@@ -376,18 +376,84 @@ print_ai_http_result() {
   return 1
 }
 
-check_ai_endpoint() {
-  local url="$1" code
-  code="$(curl -k -sS -L --connect-timeout 5 --max-time 10 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)"
-  print_ai_http_result "AI" "$url" "$code"
+resolve_a_record() {
+  local server="$1" domain="$2" resolved=""
+  if command_exists dig; then
+    resolved="$(dig @"$server" "$domain" A +time=3 +tries=1 +short 2>/dev/null | awk '/^[0-9]+\./ {print; exit}')"
+  fi
+  if [ -z "$resolved" ] && command_exists nslookup; then
+    resolved="$(nslookup -type=A "$domain" "$server" 2>/dev/null | awk '/^Address: / {print $2}' | grep -E '^[0-9]+\.' | tail -n 1)"
+  fi
+  printf '%s\n' "$resolved"
+}
+
+print_port_check() {
+  local proto="$1" port="$2" name="$3"
+  if ! command_exists ss; then
+    printf "  %b 未安装 ss，跳过 %s %s 检测\n" "$(color 33 "[跳过]")" "$name" "$port"
+    return 1
+  fi
+  if [ "$proto" = "udp" ]; then
+    if ss -H -lun "sport = :$port" 2>/dev/null | awk 'NF {found=1} END{exit found?0:1}'; then
+      printf "  %b %s UDP %s 正在监听\n" "$(color 32 "[通过]")" "$name" "$port"
+      return 0
+    fi
+    printf "  %b %s UDP %s 未监听\n" "$(color 31 "[失败]")" "$name" "$port"
+    return 1
+  fi
+  if ss -H -ltn "sport = :$port" 2>/dev/null | awk 'NF {found=1} END{exit found?0:1}'; then
+    printf "  %b %s TCP %s 正在监听\n" "$(color 32 "[通过]")" "$name" "$port"
+    return 0
+  fi
+  printf "  %b %s TCP %s 未监听\n" "$(color 31 "[失败]")" "$name" "$port"
+  return 1
+}
+
+check_unlock_dns_split() {
+  local server_ip="$1" domain="$2" resolved
+  resolved="$(resolve_a_record "127.0.0.1" "$domain")"
+  if [ -z "$resolved" ]; then
+    printf "  %b %s -> 无响应\n" "$(color 31 "[DNS失败]")" "$domain"
+    return 1
+  fi
+  if [ "$resolved" = "$server_ip" ]; then
+    printf "  %b %s -> %s\n" "$(color 32 "[DNS命中]")" "$domain" "$resolved"
+    return 0
+  fi
+  printf "  %b %s -> %s（应为 %s）\n" "$(color 31 "[DNS错配]")" "$domain" "$resolved" "$server_ip"
+  return 1
+}
+
+check_unlock_dns_forward() {
+  local server_ip="$1" domain="${2:-example.com}" resolved
+  resolved="$(resolve_a_record "127.0.0.1" "$domain")"
+  if [ -z "$resolved" ]; then
+    printf "  %b %s -> 无响应\n" "$(color 31 "[转发失败]")" "$domain"
+    return 1
+  fi
+  if [ "$resolved" = "$server_ip" ]; then
+    printf "  %b %s -> %s（普通域名不应回解锁机）\n" "$(color 31 "[转发错配]")" "$domain" "$resolved"
+    return 1
+  fi
+  printf "  %b %s -> %s\n" "$(color 32 "[转发通过]")" "$domain" "$resolved"
+  return 0
+}
+
+check_unlock_sni_endpoint() {
+  local server_ip="$1" url="$2" host code
+  host="$(printf '%s\n' "$url" | awk -F/ '{print $3}')"
+  code="$(curl -k -sS -L --connect-timeout 5 --max-time 12 --resolve "${host}:443:${server_ip}" -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)"
+  print_ai_http_result "SNI" "$url" "$code"
 }
 
 show_unlock_summary() {
   clear
+  local server_ip
+  server_ip="$(detect_public_ip)"
   printf "%b\n" "$(color 36 "======================================")"
   printf "%b\n" "$(color 36 "           运行状态检测")"
   printf "%b\n" "$(color 36 "======================================")"
-  printf "公网 IP: %s\n" "$(detect_public_ip)"
+  printf "公网 IP: %s\n" "$server_ip"
   echo "--------------------------------------"
   printf "核心服务状态：\n"
   printf "  dnsmasq: %s\n" "$(service_status dnsmasq)"
@@ -402,10 +468,29 @@ show_unlock_summary() {
   printf "防火墙后端: %s (放行 IP 数: %s)\n" "$FIREWALL_BACKEND" "$([ -s "$NODE_WHITELIST_FILE" ] && wc -l < "$NODE_WHITELIST_FILE" || echo 0)"
   info "若节点机 DNS 解析超时，必须在云服务商网页控制台开放 53 端口！"
   echo "--------------------------------------"
-  printf "本机 AI 连通性：\n"
-  local url ok_count=0
-  for url in "${AI_CHECK_URLS[@]}"; do if check_ai_endpoint "$url"; then ok_count=$((ok_count + 1)); fi; done
-  printf "  通过项: %s/%s\n" "$ok_count" "${#AI_CHECK_URLS[@]}"
+  printf "端口监听：\n"
+  print_port_check udp 53 "dnsmasq"
+  print_port_check tcp 53 "dnsmasq"
+  print_port_check tcp 443 "sniproxy"
+  echo "--------------------------------------"
+  printf "DNS 分流检测（查询本机 dnsmasq）：\n"
+  local domain dns_ok_count=0 dns_total=0
+  check_unlock_dns_forward "$server_ip" "example.com" || true
+  for domain in "chatgpt.com" "claude.ai" "gemini.google.com" "perplexity.ai"; do
+    dns_total=$((dns_total + 1))
+    if check_unlock_dns_split "$server_ip" "$domain"; then dns_ok_count=$((dns_ok_count + 1)); fi
+  done
+  printf "  AI 域名命中: %s/%s\n" "$dns_ok_count" "$dns_total"
+  echo "--------------------------------------"
+  printf "SNI 解锁链路检测（强制域名连接到解锁机 443）：\n"
+  local url sni_ok_count=0 sni_total=0
+  for url in "${AI_CHECK_URLS[@]}"; do
+    sni_total=$((sni_total + 1))
+    if check_unlock_sni_endpoint "$server_ip" "$url"; then sni_ok_count=$((sni_ok_count + 1)); fi
+  done
+  printf "  SNI 通过项: %s/%s\n" "$sni_ok_count" "$sni_total"
+  echo "--------------------------------------"
+  info "这个检测看的是解锁链路；节点机仍需加入白名单，并在云安全组放行 UDP/TCP 53 与 TCP 443。"
 }
 
 show_service_status_detail() {
@@ -1072,7 +1157,7 @@ fn dashboard_html(state: &AppState, session: &Session, host: &str, q: &HashMap<S
     let checks = AI_URLS
         .iter()
         .map(|u| {
-            let ok = check_ai(u);
+            let ok = check_sni(u, &ip);
             format!(
                 r#"<div class="check"><span class="{}">{}</span><strong>{}</strong></div>"#,
                 if ok { "ok" } else { "bad" },
@@ -1098,7 +1183,7 @@ fn dashboard_html(state: &AppState, session: &Session, host: &str, q: &HashMap<S
   </div>
 </section>
 <section class="glass"><div class="head"><div><h2>节点机快速使用命令</h2><p>在节点机 root 终端执行。</p></div></div><pre class="cmd">{quick}</pre></section>
-<section class="glass"><div class="head"><div><h2>AI 访问测试</h2><p>只把 2xx 计为通过。</p></div></div><div class="checks">{checks}</div></section>"#,
+<section class="glass"><div class="head"><div><h2>SNI 解锁链路测试</h2><p>强制域名连接到本机 443，只把 2xx 计为通过。</p></div></div><div class="checks">{checks}</div></section>"#,
         flash = flash(q),
         ip = html(&ip),
         dns = service_status("dnsmasq"),
@@ -1517,10 +1602,30 @@ fn detect_public_ip() -> String {
     output("sh", &["-c", "hostname -I 2>/dev/null | awk '{print $1}'"])
 }
 
-fn check_ai(url: &str) -> bool {
+fn check_sni(url: &str, server_ip: &str) -> bool {
+    let host = url.split('/').nth(2).unwrap_or("");
+    if host.is_empty() || server_ip.is_empty() {
+        return false;
+    }
+    let resolve = format!("{host}:443:{server_ip}");
     output(
         "curl",
-        &["-k", "-sS", "-L", "--connect-timeout", "5", "--max-time", "10", "-o", "/dev/null", "-w", "%{http_code}", url],
+        &[
+            "-k",
+            "-sS",
+            "-L",
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            "12",
+            "--resolve",
+            &resolve,
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            url,
+        ],
     )
     .starts_with('2')
 }
