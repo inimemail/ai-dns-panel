@@ -589,7 +589,7 @@ random_string() {
 }
 
 random_password() {
-  local len="${1:-22}" chars='A-Za-z0-9@#%+=_:,.-' specials='@#%+=_:,.-' body special
+  local len="${1:-22}" chars='A-Za-z0-9@#%+=_.-' specials='@#%+=_.-' body special
   [ "$len" -lt 2 ] 2>/dev/null && len=2
   if command_exists tr; then
     body="$(tr -dc "$chars" </dev/urandom 2>/dev/null | head -c "$((len - 1))")"
@@ -857,6 +857,14 @@ async fn main() -> io::Result<()> {
         }
         println!("{}", make_auth_line(user, pass));
         return Ok(());
+    }
+    if args.get(1).map(String::as_str) == Some("--verify-password") {
+        let user = args.get(2).map(String::as_str).unwrap_or("admin");
+        let pass = args.get(3).map(String::as_str).unwrap_or("");
+        if verify_password(user, pass) {
+            return Ok(());
+        }
+        std::process::exit(1);
     }
 
     ensure_base()?;
@@ -1572,7 +1580,7 @@ fn login_html(error: &str) -> String {
         format!(r#"<div class="alert bad">{}</div>"#, html(error))
     };
     format!(
-        r#"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>登录 - AI Unlock</title><style>{css}</style></head><body class="login"><div class="bg"></div><form class="login-box" method="post" action="/login"><h1>AI Unlock</h1><p>登录管理面板</p>{err}<label>用户名<input name="username" value="admin" autocomplete="username"></label><label>密码<input name="password" type="password" autocomplete="current-password" autofocus></label><button>登录</button></form></body></html>"#,
+        r#"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>登录 - AI Unlock</title><style>{css}</style></head><body class="login"><div class="bg"></div><form class="login-box" method="post" action="/login"><h1>AI Unlock</h1><p>登录管理面板</p>{err}<label>用户名<input name="username" autocomplete="username" autofocus></label><label>密码<input name="password" type="password" autocomplete="current-password"></label><button>登录</button></form></body></html>"#,
         css = CSS,
         err = err
     )
@@ -2144,10 +2152,24 @@ install_rust_build_deps() {
 }
 
 set_panel_password() {
-  local user="${1:-admin}" pass="$2"
+  local user="${1:-admin}" pass="$2" tmp_auth
   [ -z "$pass" ] && return 1
   [ -x "$PANEL_BIN" ] || return 1
-  "$PANEL_BIN" --hash-password "$user" "$pass" > "$PANEL_AUTH_FILE"
+  tmp_auth="$(mktemp "${PANEL_AUTH_FILE}.tmp.XXXXXX")" || return 1
+  if ! "$PANEL_BIN" --hash-password "$user" "$pass" > "$tmp_auth"; then
+    rm -f "$tmp_auth"
+    return 1
+  fi
+  if ! awk -F: 'NF == 3 && $1 != "" && $2 ~ /^[0-9a-f]{32}$/ && $3 ~ /^[0-9a-f]{64}$/ {ok=1} END {exit ok?0:1}' "$tmp_auth"; then
+    rm -f "$tmp_auth"
+    err "生成面板密码哈希失败。"
+    return 1
+  fi
+  mv -f "$tmp_auth" "$PANEL_AUTH_FILE"
+  if command_exists strings && strings "$PANEL_BIN" 2>/dev/null | grep -q -- '--verify-password' && ! "$PANEL_BIN" --verify-password "$user" "$pass" >/dev/null 2>&1; then
+    err "面板密码已写入，但本地验证失败。"
+    return 1
+  fi
 }
 
 install_panel_service() {
